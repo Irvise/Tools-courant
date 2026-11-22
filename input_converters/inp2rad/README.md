@@ -85,9 +85,13 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *DAMAGE INITIATION, CRITERION = JOHNSON COOK
 
+*DAMAGE EVOLUTION, TYPE = DUCTILE (written as a /FUNCT curve for manual hookup)
+
 *DAMPING,( with ALPHA =, BETA =, for material damping)
 
 *DENSITY
+
+*ELASTIC (isotropic, engineering constants, and traction forms)
 
 *DISTRIBUTING
 
@@ -194,3 +198,14 @@ Supported keywords: (not all sub-options necessarily supported):
 *UNIAXIAL TEST DATA
 
 *VISCOELASTIC, TIME = PRONY
+
+## Material support
+
+The material conversion is summarised in [docs/SUPPORT.md](../../docs/SUPPORT.md). Key points:
+
+* Material dispatch uses required-key subset checks: unsupported extra parameters no longer drop a whole material.
+* `*ELASTIC, ENGINEERING CONSTANTS` with all nine constants is written as a true orthotropic `/MAT/LAW93` material; incomplete data falls back to E1/nu12 with a warning.
+* `*PLASTIC` with `HARDENING=JOHNSON COOK`, `KINEMATIC`, `COMBINED`, or with temperature/field columns is skipped with a warning instead of producing a bogus stress-strain curve.
+* Multi-term Ogden (`N>1`) is written with all mu/alpha/D pairs.
+* `*DAMAGE EVOLUTION` tables are emitted as `/FUNCT` curves; they must be hooked up to a Radioss failure model manually.
+* Data that cannot be represented (temperature-dependent density/elasticity, D1 compressibility, material orientation, etc.) is reported with `### WARNING ###` messages; retained-but-ignored temperature/orientation data is also noted in generated deck comments.

@@ -631,6 +631,51 @@ def create_nblocks(nsets):
 
 
 ####################################################################################################
+# Helpers shared by the material conversion / writing functions                                      #
+####################################################################################################
+def get_named_parameter(line, name):
+    """Return the value of NAME=... (quoted or bare) or None."""
+    match = re.search(
+        r'\b' + re.escape(name) + r'\s*=\s*("([^"]+)"|([^,\s]+))',
+        line, re.IGNORECASE
+        )
+    if not match:
+        return None
+    return match.group(2) if match.group(2) is not None else match.group(3)
+
+
+def parse_numeric_row(line):
+    """Return the leading numeric fields of a comma-separated .inp data row."""
+    values = []
+    for field in line.split(','):
+        field = field.strip()
+        if not field:
+            values.append(None)
+            continue
+        try:
+            values.append(float(field))
+        except ValueError:
+            break
+    return values
+
+
+def warn_ignored_material_data(material_name, keyword, detail):
+    """Single place for the 'data present but not converted' warning."""
+    print(f"### WARNING ###: {keyword} data for material '{material_name}': {detail}")
+
+
+def read_data_rows(input_lines, start_index):
+    """Return (data rows, last consumed index) for a keyword data block."""
+    rows = []
+    i = start_index
+    while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+        if input_lines[i].strip():
+            rows.append(input_lines[i].strip())
+        i += 1
+    return rows, i - 1
+
+
+####################################################################################################
 # Function to convert material data                                                                #
 ####################################################################################################
 def convert_materials(input_lines, nset_counter):
@@ -650,7 +695,8 @@ def convert_materials(input_lines, nset_counter):
     while i < len(input_lines):
         line = input_lines[i].strip()
 
-        material_line_pattern = r'^\s*\*MATERIAL\s*,?\s*NAME\s*=\s*[^,]+(?:\s*,\s*.+)?$'
+        # NAME= may appear in any position among the *MATERIAL parameters.
+        material_line_pattern = r'^\s*\*material\b.*\bname\s*=\s*[^,]+'
         material_line_match = re.search(material_line_pattern, line, re.IGNORECASE)
 
         rigid_line_pattern = r'^\s*\*ELEMENT\s*,?\s*TYPE\s*=\s*R3D[34]\b.*$'
@@ -683,14 +729,24 @@ def convert_materials(input_lines, nset_counter):
         mooney_rivlin_pattern = r'^\*\s*hyperelastic\b.*,\s*mooney-rivlin'
         mooney_rivlin_line_match = re.search(mooney_rivlin_pattern, line, re.IGNORECASE)
 
-        mass_line_pattern = r'^\s*\*mass\s*,?\s*elset\s*=\s*[^,]+(?:\s*,\s*.+)?$'
-        mass_line_match = re.search(mass_line_pattern, line, re.IGNORECASE)
+        # *MASS may also be written without an ELSET (node, mass rows).
+        mass_any_line_match = re.search(r'^\s*\*mass\b', line, re.IGNORECASE)
 
         damage_init_jc_pattern = r'^\s*\*damage\s+initiation\s*,\s*criterion\s*=\s*johnson\s+cook\b.*$'
         damage_init_jc_line_match = re.search(damage_init_jc_pattern, line, re.IGNORECASE)
 
+        damage_evolution_pattern = r'^\s*\*damage\s+evolution\b.*$'
+        damage_evolution_line_match = re.search(damage_evolution_pattern, line, re.IGNORECASE)
+
         if material_line_match:
-            material_name = line.split('=')[1].strip()#.lower()
+            # Use a targeted NAME= search: a plain split('=')[1] truncates names
+            # containing '=' and breaks when another parameter comes first.
+            material_name = get_named_parameter(line, 'name')
+            if not material_name:
+                warn_ignored_material_data('<unknown>', '*MATERIAL',
+                                           'missing NAME=, material skipped')
+                i += 1
+                continue
 
             # Assign a material ID to the material
             material_names[material_name] = {'material_id': material_id}
@@ -726,46 +782,95 @@ def convert_materials(input_lines, nset_counter):
             i += 1
             continue
 
-        # mass
-        elif mass_line_match:
-            # regular expression to find 'elset =' or 'elset='
-            elset_pattern = r'\bELSET\s*=\s*("([\w\-+/ ]+)"|[\w\-+/ ]+)'
-            elset_match = re.search(elset_pattern, line, re.IGNORECASE)
-            material_name = elset_match.group(1).strip()
-            if material_name:
-                material_id += 1  # Increment the material ID
+        # mass (with an ELSET or with explicit node/mass rows)
+        elif mass_any_line_match:
+            elset_match = re.search(r'\bELSET\s*=\s*("([\w\-+/ ]+)"|[\w\-+/ ]+)',
+                                    line, re.IGNORECASE)
+            mass_rows, i = read_data_rows(input_lines, i + 1)
+            if elset_match:
+                material_name = elset_match.group(1).strip()
+                material_id += 1
                 material_names[material_name] = {'material_id': material_id}
                 material_names[material_name]['masselement'] = "yes"
-            i += 1
-
-            massdata_line = input_lines[i].strip()
-            massdata_value = massdata_line.split(',')[0]
-
-            massdata_value = float(massdata_value)
-            material_names[material_name]['mass'] = massdata_value
-
+                values = parse_numeric_row(mass_rows[0]) if mass_rows else []
+                if values and values[0] is not None:
+                    material_names[material_name]['mass'] = values[0]
+                else:
+                    warn_ignored_material_data(
+                        material_name, '*MASS',
+                        "no numeric mass value found; value set to 0"
+                        )
+                    material_names[material_name]['mass'] = 0.0
+            else:
+                # No ELSET: build a node group from the *MASS data rows so the
+                # /ADMAS card still has a valid Grnod_ID.
+                nodes = []
+                total_mass = 0.0
+                for row in mass_rows:
+                    fields = [field.strip() for field in row.split(',')]
+                    if len(fields) >= 2 and fields[0].isdigit():
+                        try:
+                            nodes.append(fields[0])
+                            total_mass += float(fields[1])
+                        except ValueError:
+                            warn_ignored_material_data(
+                                '<unknown>', '*MASS',
+                                f"invalid mass value on node {fields[0]}; row skipped"
+                                )
+                if nodes:
+                    material_name = f"MASS_NODES_{material_id + 1}"
+                    material_id += 1
+                    # Allocate the node-group ID here (and return the advanced
+                    # counter) so successive *MASS cards cannot reuse it.
+                    nset_counter += 1
+                    material_names[material_name] = {
+                        'material_id': material_id,
+                        'masselement': "yes",
+                        'mass': total_mass,
+                        'mass_nodes': nodes,
+                        'mass_grnid': nset_counter
+                    }
+                    warn_ignored_material_data(
+                        material_name, '*MASS',
+                        "no ELSET given; a /GRNOD/NODE group was generated from "
+                        f"{len(nodes)} node(s) with ID {nset_counter}"
+                        )
+                else:
+                    warn_ignored_material_data(
+                        '<unknown>', '*MASS',
+                        "no ELSET and no valid node/mass rows; mass skipped"
+                        )
             continue
 
         # density
         elif current_material_name and line.lower().startswith('*density'):
-            i += 1
-            density_line = input_lines[i].strip()
-            
-            # Check if we have valid density data
-            if density_line and density_line.split(',')[0].strip():
-                try:
-                    density_value = float(density_line.split(',')[0])
-                    material_names[current_material_name]['rho'] = density_value
-                    rho_magnitude = max(rho_magnitude, density_value)
-                except ValueError:
-                    print(f"### WARNING ###: Invalid density value for material {current_material_name}")
-                    print(f"                 Line content: '{density_line}'")
-                    print("                 Skipping this density definition...")
+            density_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(density_rows[0]) if density_rows else []
+            if values and values[0] is not None:
+                density_value = values[0]
+                material_names[current_material_name]['rho'] = density_value
+                rho_magnitude = max(rho_magnitude, density_value)
+
+                # Abaqus writes "rho, temperature" rows for a temperature
+                # dependent density.  Radioss material cards have no matching
+                # column, so keep the first value and warn about the rest.
+                temperature_rows = [
+                    (row_values[1], row_values[0])
+                    for row_values in (parse_numeric_row(row) for row in density_rows)
+                    if len(row_values) > 1 and row_values[1] is not None
+                ]
+                if temperature_rows:
+                    material_names[current_material_name]['density_temperature_data'] = temperature_rows
+                    warn_ignored_material_data(
+                        current_material_name, '*DENSITY',
+                        "temperature dependency found; only the first density "
+                        f"({density_value}) is used. Rows: {temperature_rows}"
+                        )
             else:
-                print(f"### WARNING ###: Empty density data for material {current_material_name}")
-                print(f"                 Line content: '{density_line}'")
-                print("                 Expected format: density_value")
-                print("                 Skipping this density definition...")
+                warn_ignored_material_data(
+                    current_material_name, '*DENSITY',
+                    "missing or invalid density value; this definition was skipped"
+                    )
 
         # elastic
         elif (
@@ -774,65 +879,75 @@ def convert_materials(input_lines, nset_counter):
                 and not 'traction' in line.strip().lower()
                 and not 'engineering constants' in line.strip().lower()
             ):
-            i += 1
-            elastic_line = input_lines[i].strip()
-            elastic_values = elastic_line.split(',')[0:2]
-            
-            # Check if we have valid values before converting
-            if len(elastic_values) >= 2 and elastic_values[0].strip() and elastic_values[1].strip():
-                try:
-                    emodulus, poissrat = map(float, elastic_values)
-                    material_names[current_material_name]['emodulus'] = emodulus
-                    e_magnitude = max(e_magnitude, emodulus)
-                    material_names[current_material_name]['poissrat'] = poissrat
-                except ValueError:
-                    print(f"### WARNING ###: Invalid elastic values for material {current_material_name}")
-                    print(f"                 Line content: '{elastic_line}'")
-                    print("                 Skipping this elastic definition...")
-            else:
-                print(f"### WARNING ###: Incomplete elastic data for material {current_material_name}")
-                print(f"                 Line content: '{elastic_line}'")
-                print("                 Expected format: E_modulus, Poisson_ratio")
-                print("                 Skipping this elastic definition...")
+            elastic_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(elastic_rows[0]) if elastic_rows else []
+            if len(values) >= 2 and values[0] is not None and values[1] is not None:
+                emodulus, poissrat = values[0], values[1]
+                material_names[current_material_name]['emodulus'] = emodulus
+                e_magnitude = max(e_magnitude, emodulus)
+                material_names[current_material_name]['poissrat'] = poissrat
 
-        # elastic with engineering constants:
-        # NB: Today we look at 1st direction elastic constants only, and convert to /MAT/LAW1
-        # orthotropy is not implemented
-        # in future we may look to implement orthotropy along with orthotropic property
+                # "E, nu, temperature" rows: keep the first row and warn.
+                temperature_rows = [
+                    (row_values[2], row_values[0], row_values[1])
+                    for row_values in (parse_numeric_row(row) for row in elastic_rows)
+                    if len(row_values) > 2 and row_values[2] is not None
+                ]
+                if temperature_rows:
+                    material_names[current_material_name]['elastic_temperature_data'] = temperature_rows
+                    warn_ignored_material_data(
+                        current_material_name, '*ELASTIC',
+                        "temperature dependency found; only the first (E, nu) "
+                        f"pair is used. Rows: {temperature_rows}"
+                        )
+            else:
+                warn_ignored_material_data(
+                    current_material_name, '*ELASTIC',
+                    "missing or invalid E/nu values; this definition was skipped"
+                    )
+
+        # elastic with engineering constants: mapped to an orthotropic law when
+        # all nine constants are supplied; incomplete data falls back to the
+        # first isotropic pair with an explicit warning.
         elif (
                 current_material_name
                 and line.strip().lower().startswith('*elastic')
                 and not 'traction' in line.strip().lower()
                 and 'engineering constants' in line.strip().lower()
              ):
-            print("**************************************************************************")
-            print("### WARNING ###: Engineering Constants (Orthotropy) Defined In Material:")
-            print(f"                 {current_material_name}")
-            print("                 Currently Only The First Direction Values are Used")
-            print("                 And Orthotropy is not considered")
-            print("**************************************************************************")
+            elastic_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(elastic_rows[0]) if elastic_rows else []
 
-            i += 1
-            elastic_line = input_lines[i].strip()
-            elastic_values = elastic_line.split(',')
-            
-            # Check if we have enough values and they're not empty
-            if len(elastic_values) >= 4 and elastic_values[0].strip() and elastic_values[3].strip():
-                try:
-                    emodulus = float(elastic_values[0].strip())
-                    poissrat = float(elastic_values[3].strip())
-                    material_names[current_material_name]['emodulus'] = emodulus
-                    e_magnitude = max(e_magnitude, emodulus)
-                    material_names[current_material_name]['poissrat'] = poissrat
-                except ValueError:
-                    print(f"### WARNING ###: Invalid engineering constants values for material {current_material_name}")
-                    print(f"                 Line content: '{elastic_line}'")
-                    print("                 Skipping this elastic definition...")
+            if len(values) >= 9 and all(value is not None for value in values[:9]):
+                keys = ('e1', 'e2', 'e3', 'nu12', 'nu13', 'nu23', 'g12', 'g13', 'g23')
+                material_names[current_material_name]['orthotropic_constants'] = dict(
+                    zip(keys, values[:9])
+                    )
+                e_magnitude = max(e_magnitude, values[0], values[1], values[2])
+                if len(values) > 9 and values[9] is not None:
+                    warn_ignored_material_data(
+                        current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
+                        "temperature dependency found; only the first row is used"
+                        )
+                warn_ignored_material_data(
+                    current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
+                    "material directions follow the global axes; define the "
+                    "required material orientation on the Radioss property"
+                    )
+            elif len(values) >= 4 and values[0] is not None and values[3] is not None:
+                warn_ignored_material_data(
+                    current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
+                    "only 4+ constants given; orthotropy needs E1,E2,E3,NU12,"
+                    "NU13,NU23,G12,G13,G23. Falling back to E1/NU12 as isotropic"
+                    )
+                material_names[current_material_name]['emodulus'] = values[0]
+                e_magnitude = max(e_magnitude, values[0])
+                material_names[current_material_name]['poissrat'] = values[3]
             else:
-                print(f"### WARNING ###: Incomplete engineering constants data for material {current_material_name}")
-                print(f"                 Line content: '{elastic_line}'")
-                print("                 Expected format: E1, E2, E3, nu12, nu13, nu23, G12, G13, G23")
-                print("                 Skipping this elastic definition...")
+                warn_ignored_material_data(
+                    current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
+                    "missing or invalid constants; this definition was skipped"
+                    )
 
         # connect/cohesive
         elif (
@@ -841,28 +956,30 @@ def convert_materials(input_lines, nset_counter):
                 and not 'engineering constants' in line.strip().lower()
                 and 'traction' in line.strip().lower()
              ):
-            i += 1
-            cohesive_line = input_lines[i].strip()
-            cohesive_values = cohesive_line.split(',')[0:4]
-            emodulus, gmodulus1, gmodulus2, temperature = map(float, cohesive_values)
-            material_names[current_material_name]['emodulus'] = emodulus
-            e_magnitude = max(e_magnitude, emodulus)
+            cohesive_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(cohesive_rows[0]) if cohesive_rows else []
+            if len(values) < 3 or any(value is None for value in values[:3]):
+                warn_ignored_material_data(
+                    current_material_name, '*ELASTIC, TRACTION',
+                    "missing or invalid E/G1/G2 values; this definition was skipped"
+                    )
+            else:
+                emodulus, gmodulus1, gmodulus2 = values[:3]
+                material_names[current_material_name]['emodulus'] = emodulus
+                e_magnitude = max(e_magnitude, emodulus)
 
-            if gmodulus1 != gmodulus2:
-                print("****************************************************************************")
-                print("### WARNING ###: Cohesive Material With Different G1, G2 Values In Material:")
-                print(f"                 {current_material_name}")
-                print("                 Only The First G Value  Is Used")
-                print("****************************************************************************")
+                if gmodulus1 != gmodulus2:
+                    warn_ignored_material_data(
+                        current_material_name, '*ELASTIC, TRACTION',
+                        "different G1/G2 values; only the first G value is used"
+                        )
 
-            material_names[current_material_name]['gmodulus'] = gmodulus1
-            if temperature:
-                print("*************************************************************************")
-                print("### WARNING ###: Cohesive Temperature Dependent Data Present In Material:")
-                print(f"                 {current_material_name}")
-                print("                 Temperature Dependent Data Will Not Be Translated")
-                print("                 Only The First Temperature Data Set Is Used")
-                print("*************************************************************************")
+                material_names[current_material_name]['gmodulus'] = gmodulus1
+                if len(values) > 3 and values[3] is not None and values[3] != 0.0:
+                    warn_ignored_material_data(
+                        current_material_name, '*ELASTIC, TRACTION',
+                        "temperature dependency found; only the first data set is used"
+                        )
 
         # hyperfoam
         elif current_material_name and line.lower().startswith('*hyperfoam'):
@@ -1014,6 +1131,36 @@ def convert_materials(input_lines, nset_counter):
                 extra_material_names[current_material_name]['jc_damage_data'] = jc_damage_data
             i -= 1
 
+        # damage evolution: keep the (plastic strain, damage) table as a
+        # Radioss function.  Abaqus damage evolution has no one-to-one Radioss
+        # failure card, so the table is written for manual hookup rather than
+        # being silently discarded or turned into a bogus failure law.
+        elif current_material_name and damage_evolution_line_match:
+            damage_type = get_named_parameter(line, 'type') or 'DUCTILE'
+            damage_rows, i = read_data_rows(input_lines, i + 1)
+            xy_data = []
+            for row in damage_rows:
+                values = parse_numeric_row(row)
+                if len(values) >= 2 and values[0] is not None and values[1] is not None:
+                    xy_data.append((values[0], values[1]))
+            if xy_data:
+                fct_id += 1
+                extra_material_names[current_material_name]['damage_evolution_data'] = {
+                    'fct_id': fct_id,
+                    'type': damage_type.upper(),
+                    'xy_data': xy_data
+                }
+                warn_ignored_material_data(
+                    current_material_name, '*DAMAGE EVOLUTION',
+                    f"TYPE={damage_type.upper()} table written as a /FUNCT only; "
+                    "map it to a Radioss failure model manually"
+                    )
+            else:
+                warn_ignored_material_data(
+                    current_material_name, '*DAMAGE EVOLUTION',
+                    "no valid plastic strain / damage rows found; skipped"
+                    )
+
         # damping
         elif current_material_name and damping_line_match:
             nset_counter += 1
@@ -1065,76 +1212,114 @@ def convert_materials(input_lines, nset_counter):
 
         # plastic
         elif current_material_name and line.strip().lower().startswith('*plastic'):
-            # Check if there's rate data and extract the rate value if it exists
-            rate_data = 'rate=' in line.lower()
-            rate_value = 1.0  # Default rate value
+            unsupported = []
+            # HARDENING values may be multi-word (JOHNSON COOK), so don't use
+            # the single-token get_named_parameter here.
+            hardening_match = re.search(r'\bhardening\s*=\s*([^,]+)', line, re.IGNORECASE)
+            if hardening_match:
+                hardening = re.sub(r'\s+', ' ', hardening_match.group(1)).strip().upper()
+                if hardening in ('JOHNSON COOK', 'KINEMATIC', 'COMBINED'):
+                    unsupported.append(f'HARDENING={hardening}')
+            if re.search(r'\btemperature\s+depend', line, re.IGNORECASE):
+                unsupported.append('TEMPERATURE DEPENDENT')
+            dependencies = get_named_parameter(line, 'dependencies')
+            if dependencies and str(dependencies).strip() not in ('0', '0.0'):
+                unsupported.append(f'DEPENDENCIES={dependencies} (extra field columns)')
 
-            if rate_data:
-                # Extract the rate value after 'rate='
-                rate_value_str = line.lower().split('rate=')[1].split()[0]
-                rate_value = float(rate_value_str)
+            rate_value = 1.0
+            rate = get_named_parameter(line, 'rate')
+            if rate:
+                try:
+                    rate_value = float(rate)
+                except ValueError:
+                    warn_ignored_material_data(
+                        current_material_name, '*PLASTIC',
+                        f"invalid RATE='{rate}'; using 1.0"
+                        )
 
-            i += 1
-            plastic_data = []  # Initialize plastic_data for the current material
+            plastic_rows, i = read_data_rows(input_lines, i + 1)
+            row_values = [parse_numeric_row(row) for row in plastic_rows]
+            if any(len(values) > 2 and values[2] is not None for values in row_values):
+                unsupported.append('temperature/field column in data rows')
 
-            # Extract data while the line does not start with '*'
-            while i < len(input_lines) and not input_lines[i].startswith('*'):
-                # Read and convert the plastic data (changing to positive data)
-                data_line = input_lines[i].strip()
-                
-                # Skip empty lines
-                if not data_line:
-                    i += 1
-                    continue
-                    
-                # Check if we have valid data before converting
-                plastic_values = data_line.split(',')
-                if len(plastic_values) >= 2 and plastic_values[0].strip() and plastic_values[1].strip():
-                    try:
-                        x, y = map(float, plastic_values[0:2])
-                        plastic_data.append((abs(y), abs(x)))
-                    except ValueError:
-                        print(f"### WARNING ###: Invalid plastic data for material {current_material_name}")
-                        print(f"                 Line content: '{data_line}'")
-                        print("                 Skipping this data point...")
+            if unsupported:
+                warn_ignored_material_data(
+                    current_material_name, '*PLASTIC',
+                    f"{', '.join(unsupported)} is not supported; the stress-strain "
+                    "curve was skipped instead of being converted incorrectly"
+                    )
+            else:
+                plastic_data = []
+                for values in row_values:
+                    if len(values) >= 2 and values[0] is not None and values[1] is not None:
+                        # Abaqus uses stress, plastic strain; Radioss uses
+                        # plastic strain (X), stress (Y).
+                        plastic_data.append((abs(values[1]), abs(values[0])))
+                    else:
+                        warn_ignored_material_data(
+                            current_material_name, '*PLASTIC',
+                            "incomplete stress/strain row skipped"
+                            )
+                if plastic_data:
+                    fct_id += 1
+                    if 'plastic_data' not in material_names[current_material_name]:
+                        material_names[current_material_name]['plastic_data'] = {'rate_sets': []}
+                    material_names[current_material_name]['plastic_data']['rate_sets'].append({
+                        'fct_id': fct_id,
+                        'rate': rate_value,
+                        'xy_data': plastic_data
+                    })
                 else:
-                    print(f"### WARNING ###: Incomplete plastic data for material {current_material_name}")
-                    print(f"                 Line content: '{data_line}'")
-                    print("                 Expected format: stress, strain")
-                    print("                 Skipping this data point...")
-                    
-                i += 1
+                    warn_ignored_material_data(
+                        current_material_name, '*PLASTIC',
+                        "no valid stress-strain data found; curve skipped"
+                        )
 
-            fct_id += 1  # Increment the function ID
-
-            # Initialize the material entry for plastic data if it does not exist
-            if 'plastic_data' not in material_names[current_material_name]:
-                material_names[current_material_name]['plastic_data'] = {'rate_sets': []}
-
-            # Store plastic data in a rate set, whether rate-dependent or independent
-            material_names[current_material_name]['plastic_data']['rate_sets'].append({
-                'fct_id': fct_id,
-                'rate': rate_value,
-                'xy_data': plastic_data
-            })
-            i -= 1  # Adjust index to account for the last increment
-
-        # ogden params
+        # ogden params (N=1 or multi-term N>1)
         elif current_material_name and ogden_line_match and not 'test data input' in line.lower():
-            i += 1
-            ogden_line = input_lines[i].strip()
-            ogden_values = ogden_line.split(',')[0:3]
-            ogden_mu, ogden_alpha, ogden_D = map(float, ogden_values)
-            material_names[current_material_name]['ogden_mu'] = ogden_mu
-            material_names[current_material_name]['ogden_alpha'] = ogden_alpha
-            material_names[current_material_name]['ogden_D'] = ogden_D
+            ogden_rows, i = read_data_rows(input_lines, i + 1)
+            numeric_values = []
+            for row in ogden_rows:
+                numeric_values.extend(value for value in parse_numeric_row(row) if value is not None)
+            term_count = 1
+            n_value = get_named_parameter(line, 'n')
+            if n_value:
+                try:
+                    term_count = max(1, int(float(n_value)))
+                except ValueError:
+                    warn_ignored_material_data(
+                        current_material_name, '*HYPERELASTIC, OGDEN',
+                        f"invalid N='{n_value}'; assuming one term"
+                        )
+            if len(numeric_values) >= 3 * term_count:
+                terms = []
+                for term_index in range(term_count):
+                    mu, alpha, d1 = numeric_values[3 * term_index:3 * term_index + 3]
+                    terms.append({'mu': mu, 'alpha': alpha, 'd1': d1})
+                material_names[current_material_name]['ogden_terms'] = terms
+                # Keep the legacy single-term keys for other consumers.
+                material_names[current_material_name]['ogden_mu'] = terms[0]['mu']
+                material_names[current_material_name]['ogden_alpha'] = terms[0]['alpha']
+                material_names[current_material_name]['ogden_D'] = terms[0]['d1']
+            else:
+                warn_ignored_material_data(
+                    current_material_name, '*HYPERELASTIC, OGDEN',
+                    f"expected {3 * term_count} mu/alpha/d values, got "
+                    f"{len(numeric_values)}; this definition was skipped"
+                    )
 
         # neo-hooke params
         elif current_material_name and neohooke_line_match:
-            i += 1
-            neohooke_line = input_lines[i].strip()
-            neohooke_mu = float(neohooke_line.split(',')[0])
-            material_names[current_material_name]['neohooke_mu'] = neohooke_mu
+            neohooke_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(neohooke_rows[0]) if neohooke_rows else []
+            if values and values[0] is not None:
+                material_names[current_material_name]['neohooke_mu'] = values[0]
+                if len(values) > 1 and values[1] is not None:
+                    warn_ignored_material_data(
+                        current_material_name, '*HYPERELASTIC, NEO HOOKE',
+                        f"D1 compressibility ({values[1]}) is not mapped to "
+                        "Radioss LAW42 and was dropped"
+                        )
 
         # ogden test_data
         elif current_material_name and ogden_line_match and 'test data input' in line.lower():
@@ -1350,13 +1535,22 @@ def convert_materials(input_lines, nset_counter):
 
         # mooney-rivlin
         elif current_material_name and mooney_rivlin_line_match:
-            i += 1
-            mr_line = input_lines[i].strip()
-            mr_values = mr_line.split(',')[0:2]
-
-            mr_mu1, mr_mu2 = map(float, mr_values)
-            material_names[current_material_name]['mr_mu1'] = mr_mu1
-            material_names[current_material_name]['mr_mu2'] = mr_mu2
+            mr_rows, i = read_data_rows(input_lines, i + 1)
+            values = parse_numeric_row(mr_rows[0]) if mr_rows else []
+            if len(values) >= 2 and values[0] is not None and values[1] is not None:
+                material_names[current_material_name]['mr_mu1'] = values[0]
+                material_names[current_material_name]['mr_mu2'] = values[1]
+                if len(values) > 2 and values[2] is not None:
+                    warn_ignored_material_data(
+                        current_material_name, '*HYPERELASTIC, MOONEY-RIVLIN',
+                        f"D1 compressibility ({values[2]}) is not mapped to "
+                        "Radioss LAW42 and was dropped"
+                        )
+            else:
+                warn_ignored_material_data(
+                    current_material_name, '*HYPERELASTIC, MOONEY-RIVLIN',
+                    "missing or invalid mu values; this definition was skipped"
+                    )
 
         # superelastic
         elif current_material_name and superelastic_line_match:
@@ -1392,74 +1586,89 @@ def convert_materials(input_lines, nset_counter):
 
         i += 1  # Move to the next line
 
+    # A material without density cannot be written as a Radioss material.  In
+    # the past this failed silently, leaving parts without a material card.
+    material_definition_keys = (
+        'emodulus', 'orthotropic_constants', 'neohooke_mu', 'mr_mu1',
+        'ogden_mu', 'ogden_terms', 'marlow', 'poly_c10', 'se_mm', 'gmodulus',
+        'longterm', 'uniaxial_data'
+    )
+    for name, properties in material_names.items():
+        if properties.get('rigid') or properties.get('masselement'):
+            continue
+        if 'rho' not in properties and any(key in properties for key in material_definition_keys):
+            warn_ignored_material_data(
+                name, '*MATERIAL',
+                "no *DENSITY was defined; this material cannot be written to "
+                "the Radioss deck"
+                )
+
     return material_names, extra_material_names, fct_id, nset_counter # return material names to main convert def
 
 
 ####################################################################################################
 # Functions to check what type of materials to write based on stored dictionary data:              #
 #  called by file write section and used to call relevant material write def (next section)        #
+#  All checks are "required keys are a subset": additional (unsupported) keys must not drop       #
+#  a whole material.                                                                             #
 ####################################################################################################
 # checks for variables for elastic material and returns them to the material write section
 def check_if_mass(properties):
     desired_mps = ['material_id', 'masselement', 'mass']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 def check_if_elast(properties):
     desired_mps = ['material_id', 'rho', 'emodulus', 'poissrat']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    # Do not also emit an isotropic /MAT/ELAST for a material that has data
+    # for a more specific law (that would duplicate the material ID).
+    if (properties.get('orthotropic_constants') or properties.get('plastic_data')
+            or properties.get('gmodulus')):
+        return False
+    return set(desired_mps).issubset(properties)
+
+
+# checks for a true orthotropic elastic material (all 9 engineering constants)
+def check_if_ortho(properties):
+    desired_mps = ['material_id', 'rho', 'orthotropic_constants']
+    return set(desired_mps).issubset(properties)
 
 # checks variables for cohesive material and returns them to the material write section
 def check_if_cohesive(properties):
     desired_mps = ['material_id', 'rho', 'emodulus', 'gmodulus']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for plastic material and returns them to the material write section
 def check_if_plast(properties):
     desired_mps = ['material_id', 'rho', 'emodulus', 'poissrat', 'plastic_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for neo-hooke material and returns them to the material write section
 def check_if_neohooke(properties):
     desired_mps = ['material_id', 'rho', 'neohooke_mu']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for marlow material and returns them to the material write section
 def check_if_marlow(properties):
     desired_mps = ['material_id', 'rho', 'marlow', 'poissrat', 'uniaxial_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for ogden material and returns them to the material write section
 def check_if_ogden(properties):
-    desired_mps = ['material_id', 'rho', 'ogden_mu', 'ogden_alpha', 'ogden_D']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    if 'ogden_terms' in properties:
+        desired_mps = ['material_id', 'rho', 'ogden_terms']
+    else:
+        desired_mps = ['material_id', 'rho', 'ogden_mu', 'ogden_alpha', 'ogden_D']
+    return set(desired_mps).issubset(properties)
 
 # checks variables for ogden material and returns them to the material write section
 def check_if_ogden_c(properties):
     desired_mps = ['material_id', 'rho', 'ogden_n', 'poissrat', 'uniaxial_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for mooney-rivlin material and returns them to the material write section
 def check_if_mr(properties):
     desired_mps = ['material_id', 'rho', 'mr_mu1', 'mr_mu2']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for polynomial material and returns them to the material write section
 def check_if_poly(properties):
@@ -1467,9 +1676,7 @@ def check_if_poly(properties):
         'poly_c02', 'poly_c30', 'poly_c21', 'poly_c12', 'poly_c03', 'poly_d1', 'poly_d2',
         'poly_d3'
         ]
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for superelastic material and returns them to the material write section
 def check_if_se(properties):
@@ -1482,9 +1689,7 @@ def check_if_se(properties):
 # checks variables for hyperfoam uniaxial material and returns them to the material write section
 def check_if_hypfua(properties):
     desired_mps = ['material_id', 'rho', 'poissrat', 'longterm', 'uniaxial_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for hyperfoam mu alpha material and returns them to the material write section
 def check_if_hypfmua(properties):
@@ -1497,30 +1702,28 @@ def check_if_hypfmua(properties):
 # checks variables for rigid material and returns them to the material write section
 def check_if_rigid(properties):
     desired_mps = ['material_id', 'rho', 'rigid']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for prony_series and returns them to the material write section
 def check_if_prony(properties):
     desired_mps = ['material_id', 'prony_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for johnson-cook damage initiation and returns them to the material write section
 def check_if_jcdi(properties):
     desired_mps = ['material_id', 'jc_damage_data']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
 
 # checks variables for damping and returns them to the material write section
 def check_if_damping(properties):
     desired_mps = ['material_id', 'material_nset', 'dampalpha', 'dampbeta']
-    return all(
-        prop in properties for prop in desired_mps) and len(properties) == len(desired_mps
-        )
+    return set(desired_mps).issubset(properties)
+
+
+# checks for a tabulated damage evolution curve written as a function
+def check_if_damage_evolution(properties):
+    desired_mps = ['material_id', 'damage_evolution_data']
+    return set(desired_mps).issubset(properties)
 
 
 ####################################################################################################
@@ -1529,15 +1732,60 @@ def check_if_damping(properties):
 # MAT LAW1
 # writes elastic material
 def write_elastic_material(
-    material_id, material_name, rho, emodulus, poissrat, output_file
+    material_id, material_name, rho, emodulus, poissrat, output_file,
+    density_temperature_data=None, elastic_temperature_data=None
     ):
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    if density_temperature_data or elastic_temperature_data:
+        output_file.write("# WARNING: temperature dependent density/elastic data was ignored; "
+                          "first row only\n")
+        if density_temperature_data:
+            output_file.write(f"# DENSITY(T): {density_temperature_data}\n")
+        if elastic_temperature_data:
+            output_file.write(f"# ELASTIC(T): {elastic_temperature_data}\n")
+        output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     output_file.write(f"/MAT/ELAST/{material_id}\n")
     output_file.write(material_name + "\n")
     output_file.write("#              RHO_I\n")
     output_file.write(f"{rho:>20.15g}                   0\n")
     output_file.write("#                  E                  nu\n")
     output_file.write(f"{emodulus:>20.15g}{poissrat:>20.15g}\n")
+
+# MAT LAW93 (ORTH_HILL)
+# writes a true orthotropic elastic material from *ELASTIC, ENGINEERING CONSTANTS
+def write_orthotropic_material(material_id, material_name, rho, constants, output_file):
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write("# WARNING: material directions follow the .inp global axes; set the "
+                      "orientation on the Radioss property\n")
+    output_file.write(f"/MAT/LAW93/{material_id}\n")
+    output_file.write(material_name + "\n")
+    output_file.write("#              RHO_I\n")
+    output_file.write(f"{rho:>20.15g}                   0\n")
+    output_file.write("#                E11                 E22                 E33                 G12                Nu12\n")
+    output_file.write(
+        f"{constants['e1']:>20.15g}{constants['e2']:>20.15g}{constants['e3']:>20.15g}"
+        f"{constants['g12']:>20.15g}{constants['nu12']:>20.15g}\n"
+        )
+    output_file.write("#                G13                 G23                Nu13                Nu23\n")
+    output_file.write(
+        f"{constants['g13']:>20.15g}{constants['g23']:>20.15g}"
+        f"{constants['nu13']:>20.15g}{constants['nu23']:>20.15g}\n"
+        )
+    # Nrate = 0: orthotropic elastic only, no Hill plasticity.
+    output_file.write("#     Nrate         VP              Fcut\n")
+    output_file.write("         0         0                   0\n")
+    # The LAW93 block format lists the parameter-yield card and the Hill
+    # anisotropy ratios unconditionally (they have documented defaults).  Emit
+    # them explicitly so the card is complete.  SigY=1E30 (the Radioss default)
+    # keeps the material elastic; all Hill ratios default to 1.0.  See
+    # "MAT/LAW93 (ORTH_HILL)", Radioss Starter Reference Guide.
+    output_file.write("#               SigY                 QR1                 CR1                 QR2                 CR2\n")
+    output_file.write(f"{1.0e30:>20.8e}{0.0:>20}{0.0:>20}{0.0:>20}{0.0:>20}\n")
+    output_file.write("#                R11                 R22                 R12\n")
+    output_file.write(f"{1.0:>20.1f}{1.0:>20.1f}{1.0:>20.1f}\n")
+    output_file.write("#                R33                 R13                 R23\n")
+    output_file.write(f"{1.0:>20.1f}{1.0:>20.1f}{1.0:>20.1f}\n")
+
 
 # MAT LAW36
 # writes plastic material
@@ -1559,20 +1807,23 @@ def write_plastic_material(
     output_file.write("#  fct_IDp              Fscale   Fct_IDE                EInf                  CE\n")
     output_file.write("         0                   0         0                   0                   0\n")
 
+    rate_sets = plastic_data.get('rate_sets') or [{'rate': 1.0, 'fct_id': 0, 'xy_data': []}]
+
     # Write function IDs for rate-dependent sets or main data
-    function_ids = [rate_set.get('fct_id') for rate_set in plastic_data.get('rate_sets')]
+    function_ids = [rate_set.get('fct_id') or 0 for rate_set in rate_sets]
     for i in range(0, len(function_ids), 5):
         output_file.write("# func_ID1  func_ID2  func_ID3  func_ID4  func_ID5\n")
         output_file.write("".join(f"{fid:>10}" for fid in function_ids[i:i+5]).ljust(50) + "\n")
 
-    # Write scales for rate-dependent sets
-    rates = [rate_set['rate'] for rate_set in plastic_data.get('rate_sets', [{'rate': 1.0}])]
-    for i in range(0, len(rates), 5):
+    # Fscale must be 1.0 (not 0) or the stress-strain curves are scaled to
+    # zero.  A rate set may supply its own Fscale via the 'fscale' key.
+    fscales = [rate_set.get('fscale', 1.0) for rate_set in rate_sets]
+    for i in range(0, len(fscales), 5):
         output_file.write("#           Fscale_1            Fscale_2            Fscale_3            Fscale_4            Fscale_5\n")
-        output_file.write("                   0                   0                   0                   0                   0\n")
+        output_file.write("".join(f"{scale:>20.8g}" for scale in fscales[i:i+5]).ljust(100) + "\n")
 
     # Write rate values for rate-dependent sets
-    rates = [rate_set['rate'] for rate_set in plastic_data.get('rate_sets', [{'rate': 1.0}])]
+    rates = [rate_set.get('rate', 1.0) for rate_set in rate_sets]
     for i in range(0, len(rates), 5):
         output_file.write("#          Eps_dot_1           Eps_dot_2           Eps_dot_3           Eps_dot_4           Eps_dot_5\n")
         output_file.write("".join(f"{rate:>20.8e}" for rate in rates[i:i+5]).ljust(100) + "\n")
@@ -1780,21 +2031,21 @@ def write_supere_material(
 # MAT LAW82
 # writes law82 ogden material
 def write_ogden_material(
-    material_id, material_name, rho, ogden_mu, ogden_alpha, ogden_D, output_file
+    material_id, material_name, rho, ogden_terms, output_file
     ):
+    """Write LAW82 with all N mu/alpha/D term triplets."""
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     output_file.write(f"/MAT/LAW82/{material_id}\n")
     output_file.write(material_name + "\n")
     output_file.write("#              RHO_I\n")
     output_file.write(f"{rho:>20.15g}\n")
     output_file.write("#        N                            nu\n")
-    output_file.write("         1                             0\n")
-    output_file.write("#               Mu_i\n")
-    output_file.write(f"{ogden_mu:>20.15g}\n")
-    output_file.write("#            Alpha_i\n")
-    output_file.write(f"{ogden_alpha:>20.15g}\n")
-    output_file.write("#                D_i\n")
-    output_file.write(f"{ogden_D:>20.15g}\n")
+    output_file.write(f"{len(ogden_terms):>10}                             0\n")
+    for key, title in (('mu', 'Mu_i'), ('alpha', 'Alpha_i'), ('d1', 'D_i')):
+        output_file.write(f"#            {title}\n")
+        values = [term.get(key, 0.0) for term in ogden_terms]
+        for i in range(0, len(values), 5):
+            output_file.write("".join(f"{value:>20.15g}" for value in values[i:i+5]) + "\n")
 
 # MAT LAW95
 # writes law95 bergstrom boyce material
@@ -1926,17 +2177,57 @@ def write_rigid_material(
     output_file.write("#                RHO                   E                  NU\n")
     output_file.write(f"{rho:>20}              210000                 0.3\n")
 
+# DAMAGE EVOLUTION
+# writes the (plastic strain, damage) table as a Radioss function
+def write_damage_evolution(material_id, damage_data, material_name, output_file):
+    fct_id = damage_data.get('fct_id')
+    if not fct_id:
+        return
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"# Damage evolution ({damage_data.get('type', 'DUCTILE')}) for material ID {material_id}\n")
+    output_file.write("# WARNING: map this curve to a Radioss failure model manually\n")
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"/FUNCT/{fct_id}\n")
+    output_file.write(f"Damage evolution for {material_name}\n")
+    output_file.write("#                  X                   Y\n")
+    for x, y in damage_data.get('xy_data', []):
+        output_file.write(f"{x:>20.15g}{y:>20.15g}\n")
+
+
 # MASSES
 # writes admas cards
-def write_admas(material_name, nsets, mass, output_file):
-    nset_data = nsets.get(material_name)
-    #look up the nset counter for the referenced nset (based on the surface)
-    admas_grnid = nset_data['id'] if nset_data else 0
+def write_admas(material_name, nsets, mass, output_file, mass_nodes=None, mass_grnid=None):
+    if mass_nodes:
+        # *MASS without ELSET: create a dedicated node group from the card.
+        # The ID is allocated during material conversion, so it is unique and
+        # write_output does not need an nset_counter argument.
+        if not mass_grnid:
+            warn_ignored_material_data(
+                material_name, '*MASS',
+                "no node group ID available; mass card skipped"
+                )
+            return
+        admas_grnid = mass_grnid
+        output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+        output_file.write(f"/GRNOD/NODE/{admas_grnid}\n")
+        output_file.write(f"Nodes for {material_name} mass\n")
+        output_file.write("#   NODEID\n")
+        for i in range(0, len(mass_nodes), 10):
+            output_file.write("".join(f"{node:>10}" for node in mass_nodes[i:i+10]) + "\n")
+    else:
+        nset_data = nsets.get(material_name)
+        admas_grnid = nset_data.get('id') if nset_data else None
+        if not admas_grnid:
+            # /ADMAS/0/0 references a non-existent group; skip instead.
+            warn_ignored_material_data(
+                material_name, '*MASS',
+                f"node group '{material_name}' could not be resolved; /ADMAS skipped"
+                )
+            return
+
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     output_file.write(f"/ADMAS/0/{admas_grnid}\n")
-    #print(f"ADMAS derived from {material_name}\n")
     output_file.write(f"ADMAS from ELSET: {material_name}\n")
-    #print(f"name: {material_name}")
     output_file.write("#               Mass   grnd_ID\n")
     output_file.write(f"{mass:>20.15g}{admas_grnid:>10}\n")
 
@@ -6287,24 +6578,49 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
 
         output_file.write(header_block)  # Write the header block
 
+        # A material may satisfy more than one check when extra data is present.
+        # Emit at most one main material card per material ID.
+        written_main_materials = set()
+
+        def claim_material(material_id):
+            if material_id in written_main_materials:
+                return False
+            written_main_materials.add(material_id)
+            return True
+
+        #MAT LAW93 (orthotropic elastic)
+        for material_name, properties in material_names.items():
+            if check_if_ortho(properties):
+                material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
+                write_orthotropic_material(material_id, material_name, properties['rho'],
+                    properties['orthotropic_constants'], output_file)
+
         #MAT LAW1
         for material_name, properties in material_names.items():
             #print(material_names)
             if check_if_elast(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 emodulus = properties['emodulus']
                 poissrat = properties['poissrat']
 
                 # Write the card format for materials elastic properties
                 write_elastic_material(material_id, material_name, rho,
-                    emodulus, poissrat, output_file
+                    emodulus, poissrat, output_file,
+                    properties.get('density_temperature_data'),
+                    properties.get('elastic_temperature_data')
                     )
 
         #MAT LAW36
         for material_name, properties in material_names.items():
             if check_if_plast(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 emodulus = properties['emodulus']
                 poissrat = properties['poissrat']
@@ -6319,6 +6635,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_neohooke(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 neohooke_mu = properties['neohooke_mu']
 
@@ -6329,6 +6647,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_mr(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 mr_mu1 = properties['mr_mu1']
                 mr_mu2 = properties['mr_mu2']
@@ -6340,6 +6660,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_cohesive(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 emodulus = properties['emodulus']
                 gmodulus = properties['gmodulus']
@@ -6353,6 +6675,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_hypfmua(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 n = properties['n']
                 longterm = properties['longterm']
@@ -6369,6 +6693,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_ogden_c(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 ogden_n = properties['ogden_n']
                 poissrat = properties['poissrat']
@@ -6383,6 +6709,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_hypfua(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 poissrat = properties['poissrat']
                 uniaxial_data = properties['uniaxial_data']
@@ -6397,6 +6725,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_se(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 emodulus = properties['emodulus']
                 se_mm = properties['se_mm']
@@ -6421,20 +6751,26 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_ogden(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
-                ogden_mu = properties['ogden_mu']
-                ogden_alpha = properties['ogden_alpha']
-                ogden_D = properties['ogden_D']
+                ogden_terms = properties.get('ogden_terms')
+                if not ogden_terms:
+                    ogden_terms = [{
+                        'mu': properties['ogden_mu'],
+                        'alpha': properties['ogden_alpha'],
+                        'd1': properties['ogden_D']
+                    }]
 
                 # Write the card format for materials with ogden properties
-                write_ogden_material(material_id, material_name, rho, ogden_mu, ogden_alpha,
-                    ogden_D, output_file
-                    )
+                write_ogden_material(material_id, material_name, rho, ogden_terms, output_file)
 
         #MAT LAW95
         for material_name, properties in material_names.items():
             if check_if_poly(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 poly_c10 = properties['poly_c10']
                 poly_c01 = properties['poly_c01']
@@ -6459,6 +6795,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_marlow(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
                 poissrat = properties['poissrat']
                 uniaxial_data = properties['uniaxial_data']
@@ -6485,7 +6823,14 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
  
                 # Write the card format for johnson failure properties
                 write_jcdi(material_id, jc_damage_data, output_file)
-        
+
+        #DAMAGE EVOLUTION (tabulated as a function for manual hookup)
+        for material_name, properties in extra_material_names.items():
+            if check_if_damage_evolution(properties):
+                material_id = properties['material_id']
+                write_damage_evolution(material_id, properties['damage_evolution_data'],
+                                       material_name, output_file)
+
         #DAMPING
         for material_name, properties in extra_material_names.items():
             if check_if_damping(properties):
@@ -6501,6 +6846,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         for material_name, properties in material_names.items():
             if check_if_rigid(properties):
                 material_id = properties['material_id']
+                if not claim_material(material_id):
+                    continue
                 rho = properties['rho']
 
                 # Write the card format for materials with rigid properties
@@ -6517,7 +6864,8 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
                 #input(f"mass is {mass}")
 
                 # Write the card format for /ADMAS masses
-                write_admas(material_name, nsets, mass, output_file)
+                write_admas(material_name, nsets, mass, output_file,
+                            properties.get('mass_nodes'), properties.get('mass_grnid'))
 
         if run_timer:
             elapsed_time = time.time() - start_time
