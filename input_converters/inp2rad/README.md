@@ -75,13 +75,17 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *COHESIVE SECTION
 
-*CONTACT
+*CONTACT (global general contact; friction comes from *CONTACT PROPERTY ASSIGNMENT or RADIOSS_GENERAL)
 
-*CONTACT PAIR
+*CONTACT CONTROLS (STIFFNESS= / GAP= map to Type24 Stfac and Gap_max; other options are warned and dropped)
+
+*CONTACT EXCLUSIONS (detected and warned; excluded pairs are dropped, not translated)
+
+*CONTACT PAIR (slider surfaces; friction is taken from the referenced interaction)
 
 *CONTACT PROPERTY ASSIGNMENT
 
-*COUPLING, *DISTRIBUTING or *KINEMATIC
+*COUPLING, *DISTRIBUTING or *KINEMATIC (KINEMATIC uses the generated reference-node NSET)
 
 *DAMAGE INITIATION, CRITERION = JOHNSON COOK
 
@@ -181,16 +185,22 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *SUPERELASTIC
 
-*SURFACE, TYPE=ELEMENT or TYPE=NODE
+*SURFACE, TYPE=ELEMENT or TYPE=NODE (numeric shell faces 1/2 -> spos/sneg and solid faces 1..6 -> s1..s6; degraded S6/S8 shells and 2-D/beam elements are supported; TYPE=NODE surfaces are represented by their node group and cannot be used as contact/pressure surfaces)
 
-*SURFACE INTERACTION
+*SURFACE INTERACTION (constant coefficient or ROUGH; rate/temperature-dependent friction and cohesive behaviour are warned and dropped)
 
 *SURFACE INTERACTION, NAME=RADIOSS_GENERAL (special usecase to ease PrePoMax usage, existence of this will result in a global general contact)
 
 *SYSTEM
 
-*TIE (TYPE = NODE TO SURFACE or TYPE = SURFACE TO SURFACE)
+*TIE (TYPE = NODE TO SURFACE or TYPE = SURFACE TO SURFACE; POSITION TOLERANCE and raw NSET names are supported)
+
+*MPC (TIE, BEAM; HINGE/PIN are approximated by rigid links with a warning)
 
 *UNIAXIAL TEST DATA
 
 *VISCOELASTIC, TIME = PRONY
+
+For the detailed mapping of contact, tie, coupling, rigid-body and MPC
+keywords — including known limitations and the warnings emitted for dropped
+settings — see [docs/SUPPORT.md](../../docs/SUPPORT.md).

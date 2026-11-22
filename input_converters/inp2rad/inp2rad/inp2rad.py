@@ -304,11 +304,18 @@ def convert_distcoup(input_lines):
             output_lines.append(node)
 
     for surface, data in coupling_data.items():
-        if refnode:
+        # P0 FIX: use the reference node belonging to THIS coupling.  The old
+        # ``if refnode`` tested a stale value left over from the last DCOUP3D
+        # element (or None), so a *COUPLING/*DISTRIBUTING pair with no
+        # DCOUP3D anywhere in the deck lost its distributing coupling entirely.
+        coupling_refnode = data.get('refnode')
+        if coupling_refnode:
+            # Keep the generated RBE3 id (convert_discoup replaces
+            # "placeholder" with the next free element id).
             output_lines.append("*DISCOUP, ID=placeholder")
             output_lines.append(surface)
             output_lines.append(data['count'])
-            output_lines.append(data['refnode'])
+            output_lines.append(coupling_refnode)
             for node, weight in data.get('nodes', []):
                 nset_name = f"nodeset_for_{node}"
                 output_lines.append(f"{nset_name}, {weight}")
@@ -316,6 +323,10 @@ def convert_distcoup(input_lines):
                 nset_name = f"nodeset_for_{node}"
                 output_lines.append(f"*NSET, NSET={nset_name}")
                 output_lines.append(node)
+        else:
+            print("### WARNING ###: *COUPLING/*DISTRIBUTING for surface "
+                  f"'{surface}' has no REF NODE; the distributing coupling "
+                  "cannot be converted and is skipped.")
 
     return output_lines
 
@@ -486,6 +497,11 @@ def convert_nsets(input_lines, nset_references):
                         if value  # Ensure no empty values are added
                     ]
                 )
+                # P0: keep the *SURFACE, TYPE=NODE header in the returned deck.
+                # It was previously consumed here, so parse_surface_data never
+                # saw it and never built the "<name>___originalnodeset" alias
+                # used by node-to-surface ties.
+                output_lines.append(line + '\n')
 
             else:
                 if not nset_already:
@@ -3523,6 +3539,41 @@ def convert_segments(element_dicts):
                              'spos': spos_nodes,
                              'sneg': sneg_nodes,
                          }
+                     # P1/review: a shell's two faces share the same corner
+                     # outline and differ only in orientation.  For 6/8-node
+                     # shells nodes 4..6 / 5..8 are MID-side nodes, not the
+                     # opposite face; sneg is therefore the reversed corner
+                     # loop (matching the S3/S4 handling below).
+                     elif element_type.lower() in ('s6', 's6r'):
+                         if len(nodes) >= 3:
+                             spos_nodes = [nodes[0], nodes[1], nodes[2]]
+                             sneg_nodes = [nodes[2], nodes[1], nodes[0]]
+                             segment_dictionary[element_id] = {
+                                 'spos': spos_nodes, 'sneg': sneg_nodes,
+                             }
+                     elif element_type.lower() in ('s8', 's8r'):
+                         if len(nodes) >= 4:
+                             spos_nodes = [nodes[0], nodes[1], nodes[2], nodes[3]]
+                             sneg_nodes = [nodes[3], nodes[2], nodes[1], nodes[0]]
+                             segment_dictionary[element_id] = {
+                                 'spos': spos_nodes, 'sneg': sneg_nodes,
+                             }
+                     # P1: 2-D/line elements and beams are represented as a
+                     # two-sided line segment so they can take part in
+                     # element-based surfaces.
+                     elif element_type.lower() in ('s2', 's2r'):
+                         if len(nodes) >= 2:
+                             segment_dictionary[element_id] = {
+                                 'spos': [nodes[0], nodes[1]],
+                                 'sneg': [nodes[1], nodes[0]],
+                             }
+                     elif element_type.lower() in ('b31', 'b32', 'b33'):
+                         if len(nodes) >= 2:
+                             first, last = nodes[0], nodes[-1]
+                             segment_dictionary[element_id] = {
+                                 'spos': [first, last],
+                                 'sneg': [last, first],
+                             }
                      elif (element_type.lower() == 's3'
                          or element_type.lower() == 's3r'
                          or element_type.lower() == 'r3d3'
@@ -3541,6 +3592,36 @@ def convert_segments(element_dicts):
 ####################################################################################################
 # New Faster Function to parse segment surfaces, based on segment_dictionary                       #
 ####################################################################################################
+####################################################################################################
+# P0: robust property-name lookup for contact surfaces                                              #
+####################################################################################################
+def resolve_contact_property_part_ids(property_names, name):
+    """Return part ids for a contact surface referencing a property/group.
+
+    Grouped properties store their collecting ELSET in ``collecting_elset_name``
+    and can be keyed by an individual ELSET name.  Matching only the dictionary
+    key (the old behaviour) silently missed those surfaces.  Names are
+    normalised (quotes/whitespace stripped) and invalid ids are reported.
+    """
+    target = str(name).strip().strip('"').strip().lower()
+    part_ids = []
+    for property_name, property_data in property_names.items():
+        group_name = property_data.get('collecting_elset_name')
+        candidates = [str(property_name).strip().strip('"').strip().lower()]
+        if group_name:
+            candidates.append(str(group_name).strip().strip('"').strip().lower())
+        if target not in candidates:
+            continue
+        try:
+            property_id = int(property_data['prop_id'])
+        except (KeyError, TypeError, ValueError):
+            print(f"### WARNING ###: contact surface '{name}' references "
+                  f"property '{property_name}' with invalid prop_id; skipped.")
+            continue
+        part_ids.append(property_data.get('part_id', property_id))
+    return part_ids
+
+
 def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
     segment_dictionary, property_names
     ):
@@ -3552,6 +3633,26 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
     surf_already_processed = False
     allsurf = False
     prop_lines = []
+
+    def segment_for_target(target):
+        """Return a representative segment dict for a surface entry."""
+        if isinstance(target, int) and target in segment_dictionary:
+            return segment_dictionary[target]
+        for elset_name, elements in elset_dicts.items():
+            if elset_name == target:
+                for element_id in elements:
+                    try:
+                        seg = segment_dictionary.get(int(element_id))
+                    except (TypeError, ValueError):
+                        continue
+                    if seg:
+                        return seg
+        return None
+
+    def is_shell_face_target(target):
+        """True when a surface entry refers to shell (spos/sneg) segments."""
+        seg = segment_for_target(target)
+        return bool(seg and 'spos' in seg)
 
     remaining_lines = []
 
@@ -3585,10 +3686,28 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
         if current_node_surface_name and not line.startswith('*'):
             surface_values = line.split(",")  # Split the line by comma
             nset_name = surface_values[0].strip()#.lower()
-            nset_data = nsets.get(nset_name)
-            #look up the nset counter for the referenced nset (based on the surface)
+            # A node surface either references a named NSET, or lists node
+            # numbers directly (convert_nsets stores those under the surface
+            # name).  Look in both places so neither case resolves to 0.
+            nset_data = nsets.get(nset_name) or nsets.get(current_node_surface_name)
             ref_nset_counter = nset_data['id'] if nset_data else 0
             nsets[nset_new_name] = {'id': ref_nset_counter}
+            # P0/review: do NOT put node surfaces in surf_name_to_id.  Those
+            # ids are node-group ids, not /SURF ids, and would be emitted as
+            # Surf_IDm by *CONTACT PAIR or as surf_ID by *DSLOAD /PLOAD.
+            # Ties resolve node surfaces through the nsets aliases below;
+            # contact/pressure surfaces referencing one are warned+skipped.
+            if not ref_nset_counter:
+                print("### WARNING ###: node surface "
+                      f"'{current_node_surface_name}' references unknown NSET "
+                      f"'{nset_name}'; tie lookups will resolve to 0.")
+            else:
+                print("### WARNING ###: node surface "
+                      f"'{current_node_surface_name}' is represented by node "
+                      "group "
+                      f"'{nset_new_name}' (id {ref_nset_counter}). It is NOT a "
+                      "/SURF id: *CONTACT PAIR and *DSLOAD references to it "
+                      "are skipped; ties may use it as an approximation.")
             continue
 
         if current_node_surface_name and line.startswith('*'):
@@ -3611,6 +3730,17 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                     surface_el_byname = current_surface_name
                     allsurf = True
 
+            # P1: Abaqus numeric face ids map onto Radioss face keys: shell
+            # faces 1/2 -> spos/sneg, solid faces 1..6 -> s1..s6.
+            side_target = surface_el if surface_el is not None else surface_el_byname
+            if surface_side in ('1', '2') and is_shell_face_target(side_target):
+                surface_side = 'spos' if surface_side == '1' else 'sneg'
+            elif surface_side.isdigit() and 1 <= int(surface_side) <= 6:
+                face_key = f"s{surface_side}"
+                seg = segment_for_target(side_target)
+                if seg and face_key in seg:
+                    surface_side = face_key
+
             if surface_el and not surf_already_processed:
                 nset_name = f"{current_surface_name}___nodes"
                 nset_counter += 1
@@ -3628,15 +3758,9 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                 surf_already_processed = True
 
             if surface_el_byname is not None and allsurf is False and not surface_side:
-                # Look up the property IDs for the names in surf_el_byname
-                prop_id_list = []
-                for property_name, property_data in property_names.items():
-                   # Check if the property name matches the surface_el
-                    if property_name.lower() == surface_el_byname.lower():
-                        # Extract the part_id and add it to the list
-                        property_id = int(property_data['prop_id'])
-                        part_id = property_data.get('part_id', property_id)  # Use part_id for surface definition
-                        prop_id_list.append(part_id)
+                # P0: resolve grouped property names as well as plain ones.
+                prop_id_list = resolve_contact_property_part_ids(
+                    property_names, surface_el_byname)
 
                 # Create a /SURF/PART/EXT entry
                 props_per_line = []
@@ -3737,7 +3861,10 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                     # Append the integer 'part_id' to the list
                     prop_id_list.append(part_id)
 
-                surf_id += 1
+                # P0: the surface header already allocated ``surf_id`` and
+                # registered it in surf_name_to_id.  Incrementing again here
+                # made blank-side surfaces point at an id that was never
+                # emitted.  Reuse the allocated id.
                 props_per_line = []
 
                 for property_id in prop_id_list:
@@ -3757,6 +3884,9 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                 surface_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                 surface_lines.append(f"/SURF/PART/EXT/{surf_id}\n{current_surface_name}")
                 surface_lines.extend(prop_lines)
+                # P0: reset the buffer so the next surface does not inherit
+                # this surface's part list.
+                prop_lines = []
                 allsurf = False
 
             surface_lines.extend(surf_holder)
@@ -3822,238 +3952,351 @@ def parse_surface_interaction_data(input_lines):
 # Function to convert *CONTACT data to Type24: deals with all exterior option, and contact pairs   #
 ####################################################################################################
 def convert_contacts(input_lines, property_names, surf_id, friction_dict, surf_name_to_id):
+    """Convert *CONTACT / *CONTACT PAIR data into Radioss Type24 interfaces.
+
+    The original implementation kept several pieces of state across lines and
+    did not always advance its line index.  That caused infinite loops for
+    unresolved surfaces, lost friction continuation lines when another
+    *CONTACT PAIR followed, and duplicated general-contact interfaces.  This
+    version emits a complete interface in one place and keeps all state local
+    to the block being parsed.
+    """
     contacts = []
-    friction_ref = []
-    contact_name = None
-    interaction_name = None
-    prop_id_list = []  # Initialize an empty list
-    prop_lines = []
-    ppmcontact = False
-    contactpair = False
     inter_id = 0  # initialize interface id counter
+    pending_general = None  # dict describing a general contact awaiting friction
+    exclusions_seen = 0
 
-    i = 0 # Initialize an index for iterating through input_lines
+    # P1: Type24 stiffness/gap tuning from *CONTACT CONTROLS.
+    controls = {"stfac": 0.0, "gap": 0.0}
 
-    #this section checks for contact attributes and stores them as variables
-    while i < len(input_lines):
-        line = input_lines[i].strip()
-        conpair_pattern = r'^\s*\*CONTACT PAIR\s*(,.*)?$' # Regular expression to find '*CONTACT PAIR' contact entry section
-        contype_pattern = r'^\s*\*CONTACT\s*(,.*)?$' # Regular expression to find '*CONTACT' contact entry section
-        conexc_pattern = r'^\s*\*CONTACT\s+EXCLUSIONS\s*' # Regular expression to find '*CONTACT EXCLUSIONS' contact entry section
-        ppmtype_pattern = r'^\s*\*Surface interaction\s*,\s*Name\s*=\s*RADIOSS_GENERAL\s*(,.*)?$' # Regular expression to find special ppm input for general contact entry section
-        matchconpair = re.search(conpair_pattern, line, re.IGNORECASE)
-        matchcont = re.search(contype_pattern, line, re.IGNORECASE)
-        matchconexc = re.search(conexc_pattern, line, re.IGNORECASE)
-        matchppm = re.search(ppmtype_pattern, line, re.IGNORECASE)
-
-        if matchcont or matchppm:
-            if matchppm:
-                ppmcontact = True
-            inter_id += 1
-            contact_name = f"General Contact ID {inter_id}"
-            contact_properties_exist = False
-            i += 1
-
-        elif matchconpair:
-            interactionmatch = re.search(r'INTERACTION\s*=\s*([^\s,]+)', line, re.IGNORECASE)
-
-            if interactionmatch:
-                interaction_name = interactionmatch.group(1)
-                contactpair = True
-                i += 1
-
-        elif contactpair:
-            contact_pair_groups = line.split(",")  # Split the line by comma
-            secondary_surf = contact_pair_groups[0].strip()
-            main_surf = contact_pair_groups[1].strip()
-            secondary_surf_id = surf_name_to_id.get(secondary_surf, 0) #look up the surf counter for the referenced surface
-            main_surf_id = surf_name_to_id.get(main_surf, 0) #look up the surf counter for the referenced surface
-            if secondary_surf_id != 0 and main_surf_id != 0:
-                inter_id += 1 # Increment the inter_id
-
-                contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-                contacts.append(f"#Contact from Contact Pair: ID {inter_id} : Interaction Name: {interaction_name}")
-                contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-                contacts.append(f"/INTER/TYPE24/{inter_id}\n{interaction_name}")
-                contacts.append("# Surf_ID1  Surf_ID2      Istf                       Irem_i2                Idel")
-                contacts.append(f"{main_surf_id:>10}{secondary_surf_id:>10}         4                             0                   0")
-                contacts.append("# grnd_IDS                         Iedge          Edge_angle           Gap_max_s           Gap_max_m")
-                contacts.append("         0                             0                   0                   0                   0")
-                contacts.append("#              Stmin               Stmax     Igap0     Ipen0            Ipen_max")
-                contacts.append("                   0                   0         0         0                   0")
-                contacts.append("#              Stfac                Fric                                  Tstart               Tstop")
-                contactpair = False
-
-        # Check for the line indicating contact inclusions
-        elif ppmcontact or (contact_name and re.search(r'^\*CONTACT\s+INCLUSIONS', line, re.IGNORECASE)):
-            for property_name, property_data in property_names.items():
-                # Extract the property_id from the sub-dictionary and convert it to an integer
-                property_id = int(property_data['prop_id'])
-                part_id = property_data.get('part_id', property_id)  # Use part_id for surface definition
-                # Append the integer 'part_id' to the list (excluding springs and dummy property for masses)
-                if (not property_data['nint'] == '777' and not property_data['nint'] == '555' and not property_data['nint'] == '666'
-                and part_id not in prop_id_list):
-                    prop_id_list.append(part_id)
-
-            surf_id += 1
-            props_per_line = []
-
-            for property_id in prop_id_list:
-                props_per_line.append(f"{property_id:10d}")
-
-            # Check if we have collected 10 elements
-                if len(props_per_line) == 10:
-                    prop_lines.append("".join(props_per_line))
-                    props_per_line = []
-
-            # If there are remaining elements, add them to the last line
-            if props_per_line:
-                prop_lines.append("".join(props_per_line))
-
-            contact_name = f"General Contact ID {inter_id}"
-            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            contacts.append("#SURF PART EXT for all parts")
-            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            contacts.append(f"/SURF/PART/EXT/{surf_id}\n{contact_name}")
-            contacts.extend(prop_lines)
-            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            contacts.append(f"#General Self Contact: ID {inter_id}")
-            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            contacts.append(f"/INTER/TYPE24/{inter_id}\n{contact_name}")
-            contacts.append("# Surf_ID1  Surf_ID2      Istf                       Irem_i2                Idel")
-            contacts.append(f"{surf_id:>10}         0         4                             0                   0")
-            contacts.append("# grnd_IDS                         Iedge          Edge_angle           Gap_max_s           Gap_max_m")
-            contacts.append("         0                             0                   0                   0                   0")
-            contacts.append("#              Stmin               Stmax     Igap0     Ipen0            Ipen_max")
-            contacts.append("                   0                   0         0         0                   0")
-            contacts.append("#              Stfac                Fric                                  Tstart               Tstop")
-            prop_lines = []
-            if ppmcontact:
-                contact_properties_exist = True
-                friction_ref = "RADIOSS_GENERAL"
-                friction_value = float(friction_dict.get(friction_ref.strip(), 0))
-                contacts.append(f"                   0          {friction_value:>10}                                       0                   0")
-                contacts.append("#      IBC                        Inacti               ViscS                             ")
-                contacts.append("       000                             5                   0")
-                contacts.append("#    Ifric    Ifiltr               Xfreq             sens_ID                                 fric_ID")
-                contacts.append("         0         0                   0                   0                                       0")
-                contact_name = None
-                ppmcontact = False
-            i += 1 # move to next line
-
-        elif matchconexc:
-            print ("")
-            print(f"### WARNING ###: for Contact: {contact_name}")
-            print("### INFO ###")
-            print("contact exclusions are not converted by the inp2rad script")
-            print("please define contact pairs or include all exterior surfaces")
-            print("or make corrections to Radioss contact definitions manually if necessary")
-            if not or_gui:
-                input("Press Enter to continue...")
-            print ("")
-            i += 1 # move to next line
-
-        elif contact_name and line.lower().startswith('*contact property assignment'):
-            contact_properties_exist = True
-            i += 1 # move to next line
-
-            property_line = input_lines[i].strip()
-            friction_ref = property_line.split(',')[2]
-            friction_value = float(friction_dict.get(friction_ref.strip(), 0))
-            contacts.append(f"                   0          {friction_value:>10}                                       0                   0")
-            contacts.append("#      IBC                        Inacti               ViscS                             ")
-            contacts.append("       000                             5                   0")
-            contacts.append("#    Ifric    Ifiltr               Xfreq             sens_ID                                 fric_ID")
-            contacts.append("         0         0                   0                   0                                       0")
-            contact_name = None
-
-        elif interaction_name:
-            contact_properties_exist = True
-            friction_ref = interaction_name
-            friction_value = float(friction_dict.get(friction_ref.strip(), 0))
-            contacts.append(f"                   0          {friction_value:>10}                                       0                   0")
-            contacts.append("#      IBC                        Inacti               ViscS                             ")
-            contacts.append("       000                             5                   0")
-            contacts.append("#    Ifric    Ifiltr               Xfreq             sens_ID                                 fric_ID")
-            contacts.append("         0         0                   0                   0                                       0")
-            interaction_name = None
-
-        else:
-            i += 1 # move to the next line if no match
-
-    if contact_name and contact_properties_exist is False:
-        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-        contacts.append(f"#General Self Contact: ID {inter_id}")
-        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-        contacts.append(f"/INTER/TYPE24/{inter_id}\n{contact_name}")
-        contacts.append("# Surf_ID1  Surf_ID2      Istf                       Irem_i2                Idel")
-        contacts.append("         0         0         4                             0                   0")
-        contacts.append("# grnd_IDS                         Iedge          Edge_angle           Gap_max_s           Gap_max_m")
-        contacts.append("         0                             0                   0                   0                   0")
-        contacts.append("#              Stmin               Stmax     Igap0     Ipen0            Ipen_max")
-        contacts.append("                   0                   0         0         0                   0")
-        contacts.append("#              Stfac                Fric                                  Tstart               Tstop")
-        contacts.append("                   0                 0.0                                       0                   0")
+    def friction_lines(interaction, ppm=False):
+        """Write the trailing Fric/IBC card lines for the last TYPE24 block."""
+        try:
+            friction_value = float(friction_dict.get(interaction, 0) or 0)
+        except (TypeError, ValueError):
+            friction_value = 0.0
+            print(f"### WARNING ###: non-numeric friction '{interaction}'; using 0.0")
+        contacts.append(f"{controls['stfac']:>20.8g}{'':>10}{friction_value:>10}"
+                        "                                       0                   0")
         contacts.append("#      IBC                        Inacti               ViscS                             ")
         contacts.append("       000                             5                   0")
         contacts.append("#    Ifric    Ifiltr               Xfreq             sens_ID                                 fric_ID")
         contacts.append("         0         0                   0                   0                                       0")
-        contact_name = None
+        if ppm:
+            contacts.append("# RADIOSS_GENERAL preset: contact exclusions, if any, are not translated")
+
+    def gap_line():
+        gap = controls["gap"]
+        return (f"         0                             0                   0"
+                f"{gap:>20.8g}{gap:>20.8g}")
+
+    def emit_general_contact(general):
+        """Emit the deferred general-contact surface and TYPE24 interface."""
+        nonlocal surf_id
+        prop_id_list = []
+        for property_name, property_data in property_names.items():
+            nint = str(property_data.get('nint', ''))
+            # Springs and lumped-mass dummy properties are not contact surfaces.
+            if nint in ('777', '555', '666'):
+                continue
+            property_id = property_data['prop_id']
+            # P0: use a stable part id even for grouped/renamed properties.
+            part_id = property_data.get('part_id', property_id)
+            if part_id not in prop_id_list:
+                prop_id_list.append(part_id)
+
+        surf_id += 1
+        prop_lines = []
+        chunk = []
+        for part_id in prop_id_list:
+            chunk.append(f"{part_id:>10}")
+            if len(chunk) == 10:
+                prop_lines.append("".join(chunk))
+                chunk = []
+        if chunk:
+            prop_lines.append("".join(chunk))
+
+        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        contacts.append("#SURF PART EXT for all parts")
+        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        contacts.append(f"/SURF/PART/EXT/{surf_id}\n{general['name']}")
+        contacts.extend(prop_lines)
+        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        contacts.append(f"#General Self Contact: ID {general['inter_id']}")
+        contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        contacts.append(f"/INTER/TYPE24/{general['inter_id']}\n{general['name']}")
+        contacts.append("# Surf_ID1  Surf_ID2      Istf                       Irem_i2                Idel")
+        contacts.append(f"{surf_id:>10}         0         4                             0                   0")
+        contacts.append("# grnd_IDS                         Iedge          Edge_angle           Gap_max_s           Gap_max_m")
+        contacts.append(gap_line())
+        contacts.append("#              Stmin               Stmax     Igap0     Ipen0            Ipen_max")
+        contacts.append("                   0                   0         0         0                   0")
+        contacts.append("#              Stfac                Fric                                  Tstart               Tstop")
+        friction_lines(general['friction'], ppm=general['ppm'])
+
+    def finish_general():
+        nonlocal pending_general
+        if pending_general is not None:
+            emit_general_contact(pending_general)
+            pending_general = None
+
+    i = 0
+    while i < len(input_lines):
+        line = input_lines[i].strip()
+        if not line or line.startswith('**'):
+            i += 1
+            continue
+
+        # --- P1: contact controls (stiffness / gap tuning) -----------------
+        if re.search(r'^\*CONTACT\s+CONTROLS\b', line, re.IGNORECASE):
+            for option in ('STIFFNESS', 'STIFAC', 'STFAC'):
+                m = re.search(rf'{option}\s*=\s*([-+]?[\d.eE+-]+)', line, re.IGNORECASE)
+                if m:
+                    try:
+                        controls['stfac'] = float(m.group(1))
+                    except ValueError:
+                        print(f"### WARNING ###: invalid contact stiffness '{m.group(1)}'; ignored")
+            for option in ('GAP', 'GAP_MAX', 'GAPMAX'):
+                m = re.search(rf'{option}\s*=\s*([-+]?[\d.eE+-]+)', line, re.IGNORECASE)
+                if m:
+                    try:
+                        controls['gap'] = float(m.group(1))
+                    except ValueError:
+                        print(f"### WARNING ###: invalid contact gap '{m.group(1)}'; ignored")
+            known = ('STIFFNESS', 'STIFAC', 'STFAC', 'GAP', 'GAP_MAX', 'GAPMAX')
+            unknown = [tok.split('=')[0].strip() for tok in line.split(',')[1:]
+                       if tok.strip() and not any(k in tok.upper() for k in known)]
+            if unknown:
+                print("### WARNING ###: unsupported *CONTACT CONTROLS option(s) "
+                      f"{unknown}; those settings are dropped")
+            i += 1
+            continue
+
+        conexc = re.search(r'^\s*\*CONTACT\s+EXCLUSIONS\b', line, re.IGNORECASE)
+        if conexc:
+            exclusions_seen += 1
+            # P0/P3: never block for input(); always warn and skip the block.
+            print("### WARNING ###: *CONTACT EXCLUSIONS are not converted by "
+                  "inp2rad; excluded pairs are dropped. Define contact pairs "
+                  "or review the Radioss interfaces manually.")
+            i += 1
+            while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+                i += 1
+            continue
+
+        conpair = re.search(r'^\s*\*CONTACT\s+PAIR\b', line, re.IGNORECASE)
+        contype = re.search(r'^\s*\*CONTACT\s*(,.*)?$', line, re.IGNORECASE)
+        ppm = re.search(r'^\s*\*SURFACE\s+INTERACTION\s*,\s*NAME\s*=\s*RADIOSS_GENERAL\b',
+                        line, re.IGNORECASE)
+
+        if conpair or contype or ppm:
+            finish_general()
+
+        if conpair:
+            im = re.search(r'INTERACTION\s*=\s*([^\s,]+)', line, re.IGNORECASE)
+            interaction = im.group(1) if im else None
+            if not interaction:
+                print("### WARNING ###: *CONTACT PAIR without INTERACTION=; "
+                      "the pair is skipped")
+                i += 1
+                # Skip the data line(s) so the index always advances.
+                while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+                    i += 1
+                continue
+            i += 1
+            if i >= len(input_lines) or input_lines[i].strip().startswith('*'):
+                print(f"### WARNING ###: *CONTACT PAIR '{interaction}' has no "
+                      "surface pair data; skipped")
+                continue
+            fields = [f.strip() for f in input_lines[i].split(',')]
+            if len(fields) < 2 or not fields[0] or not fields[1]:
+                print(f"### WARNING ###: malformed *CONTACT PAIR surface line "
+                      f"'{input_lines[i].strip()}'; skipped")
+                i += 1
+                continue
+            secondary_surf, main_surf = fields[0], fields[1]
+            if len(fields) > 2:
+                print("### WARNING ###: extra fields on *CONTACT PAIR line "
+                      f"'{input_lines[i].strip()}' are dropped")
+            secondary_surf_id = surf_name_to_id.get(secondary_surf, 0)
+            main_surf_id = surf_name_to_id.get(main_surf, 0)
+            i += 1
+            if not secondary_surf_id or not main_surf_id:
+                print(f"### WARNING ###: *CONTACT PAIR '{interaction}' references "
+                      f"unknown surface(s): secondary='{secondary_surf}' "
+                      f"({secondary_surf_id}), main='{main_surf}' ({main_surf_id}); "
+                      "interface skipped")
+                continue
+            inter_id += 1
+            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+            contacts.append(f"#Contact from Contact Pair: ID {inter_id} : Interaction Name: {interaction}")
+            contacts.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+            contacts.append(f"/INTER/TYPE24/{inter_id}\n{interaction}")
+            contacts.append("# Surf_ID1  Surf_ID2      Istf                       Irem_i2                Idel")
+            contacts.append(f"{main_surf_id:>10}{secondary_surf_id:>10}         4                             0                   0")
+            contacts.append("# grnd_IDS                         Iedge          Edge_angle           Gap_max_s           Gap_max_m")
+            contacts.append(gap_line())
+            contacts.append("#              Stmin               Stmax     Igap0     Ipen0            Ipen_max")
+            contacts.append("                   0                   0         0         0                   0")
+            contacts.append("#              Stfac                Fric                                  Tstart               Tstop")
+            # Friction is emitted with the interface, so a following
+            # *CONTACT PAIR can no longer overwrite it.
+            friction_lines(interaction)
+            continue
+
+        if contype or ppm:
+            inter_id += 1
+            pending_general = {
+                'inter_id': inter_id,
+                'name': f"General Contact ID {inter_id}",
+                'friction': "RADIOSS_GENERAL" if ppm else None,
+                'ppm': bool(ppm),
+            }
+            i += 1
+            continue
+
+        if (pending_general is not None
+                and re.search(r'^\*CONTACT\s+INCLUSIONS\b', line, re.IGNORECASE)):
+            # Inclusions are already covered by the all-parts /SURF/PART/EXT.
+            i += 1
+            continue
+
+        if (pending_general is not None
+                and line.lower().startswith('*contact property assignment')):
+            i += 1
+            if i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+                fields = [f.strip() for f in input_lines[i].split(',')]
+                if len(fields) >= 3:
+                    pending_general['friction'] = fields[2]
+                else:
+                    print("### WARNING ###: malformed *CONTACT PROPERTY "
+                          f"ASSIGNMENT '{input_lines[i].strip()}'; using 0 friction")
+                i += 1
+            else:
+                print("### WARNING ###: *CONTACT PROPERTY ASSIGNMENT has no "
+                      "interaction name; using 0 friction")
+            finish_general()
+            continue
+
+        if line.startswith('*'):
+            finish_general()
+        i += 1
+
+    finish_general()
+
+    if exclusions_seen:
+        print(f"### WARNING ###: {exclusions_seen} *CONTACT EXCLUSIONS block(s) "
+              "were dropped; review contact definitions manually.")
+
+    # P1: warn about friction/cohesive data that Radioss Type24 cannot express.
+    for line in input_lines:
+        stripped = line.strip()
+        if re.search(r'^\*FRICTION\b', stripped, re.IGNORECASE) and ',' in stripped:
+            options = stripped.split(',')[1:]
+            if any('DEPEND' in opt.upper() or 'RATE' in opt.upper()
+                   or 'TEMPER' in opt.upper() for opt in options):
+                print("### WARNING ###: friction with rate/temperature "
+                      "dependencies is not translated; only the constant "
+                      "coefficient is used.")
+        if (stripped.lower().startswith('*cohesive behavior')
+                or stripped.lower().startswith('*cohesive section')):
+            print("### WARNING ###: cohesive traction-separation behaviour is "
+                  "not translated; cohesive contact is dropped.")
 
     return contacts, surf_id, inter_id
 
 
-####################################################################################################
-# Function to convert *TIE to Type2                                                                #
-####################################################################################################
 def convert_ties(input_lines, surf_name_to_id, nsets, inter_id):
-    tied_contacts = []
-    tied_contact_name = None
+    """Convert *TIE entries into Radioss Type2 tied interfaces.
 
-    for line in input_lines:
-        # Updated regex pattern to match names with special characters
-        tctype_pattern = r'^\s*\*TIE\s*,\s*NAME\s*='  # Keep the same for detecting TIE
-        matchtie = re.search(tctype_pattern, line, re.IGNORECASE)
+    P0: always consume the tie's data line and reset per-tie state, so a
+    malformed line cannot raise IndexError and a following keyword cannot
+    silently inherit the previous tie's name/type/tolerance.
+    P1: fall back to raw NSET names (and node-surface aliases) when a tie side
+    is not a generated element surface.
+    """
+    tied_contacts = []
+
+    def resolve_node_group(name):
+        """Return the node-group id for a tie's node side, or 0."""
+        for candidate in (f"{name}___nodes", f"{name}___originalnodeset", name):
+            nset_data = nsets.get(candidate)
+            if nset_data:
+                return nset_data['id'], candidate
+        return 0, name
+
+    def resolve_surface(name):
+        """Return (id, is_node_group) for a tie's main side, or (0, False)."""
+        surf_id = surf_name_to_id.get(name, 0)
+        if surf_id:
+            return surf_id, False
+        # P1: node-based surfaces are stored as node groups in ``nsets``.
+        for candidate in (f"{name}___originalnodeset", f"{name}___nodes", name):
+            nset_data = nsets.get(candidate)
+            if nset_data:
+                return nset_data['id'], True
+        return 0, False
+
+    tied_contact_name = None
+    tc_type = "node to surface"
+    tc_postol_value = 0.0
+    i = 0
+    while i < len(input_lines):
+        line = input_lines[i].strip()
+        matchtie = re.search(r'^\s*\*TIE\s*,\s*NAME\s*=', line, re.IGNORECASE)
         tc_type_match = re.search(r'TYPE\s*=\s*([^,]+)', line, re.IGNORECASE)
 
         if matchtie:
-            # Extract tied contact name from the current line
-            # Regex to capture names with special characters
-            tc_name_match = re.search(r'NAME\s*=\s*([^,]+)', line, re.IGNORECASE)
-            tc_postol_match = re.search(r'POSITION TOLERANCE\s*=\s*([^,]+)', line, re.IGNORECASE)
-            if tc_name_match:
-                tied_contact_name = tc_name_match.group(1).strip()  # Extracted name
-            else:
-                tied_contact_name = None  # Handle the case if NAME is not found
+            # Start of a new tie: reset ALL per-tie state before parsing.
+            name_match = re.search(r'NAME\s*=\s*([^,]+)', line, re.IGNORECASE)
+            tied_contact_name = name_match.group(1).strip() if name_match else None
+            tolerance_match = re.search(r'POSITION TOLERANCE\s*=\s*([^,]+)',
+                                        line, re.IGNORECASE)
+            tc_postol_value = 0.0
+            if tolerance_match:
+                try:
+                    tc_postol_value = float(tolerance_match.group(1).strip())
+                except ValueError:
+                    print(f"### WARNING ###: invalid *TIE position tolerance "
+                          f"'{tolerance_match.group(1).strip()}'; using 0.0")
+            tc_type = tc_type_match.group(1).strip().lower() if tc_type_match else "node to surface"
+            i += 1
+            continue
 
-            tc_postol_value = 0
-            if tc_postol_match:
-                tc_postol_value = float(tc_postol_match.group(1).strip())
+        if re.search(r'^\s*\*TIE\b', line, re.IGNORECASE):
+            print("### WARNING ###: *TIE without NAME= cannot be converted; skipped")
+            tied_contact_name = None
+            i += 1
+            continue
 
-            tc_type = "node to surface"
-            if tc_type_match:
-                tc_type = tc_type_match.group(1).strip().lower()
+        if tied_contact_name and not line.startswith('*'):
+            fields = [field.strip() for field in line.split(',')]
+            if len(fields) < 2 or not fields[0] or not fields[1]:
+                print(f"### WARNING ###: malformed *TIE '{tied_contact_name}' "
+                      f"surface line '{line}'; skipped")
+                tied_contact_name = None
+                i += 1
+                continue
+            if len(fields) > 2:
+                print(f"### WARNING ###: extra fields on *TIE line '{line}' "
+                      "are dropped")
+            surface_for_nodes = fields[0]
+            surface_to_tie_to = fields[1]
 
-        elif tied_contact_name and not line.startswith('*'):
-            contact_groups = line.split(",")  # Split the line by comma
-            surface_for_nodes = contact_groups[0].strip()
-            surface_to_tie_to = contact_groups[1].strip()
-            nodes_to_tie = f"{surface_for_nodes}___nodes"
-            nset_data = nsets.get(nodes_to_tie)
-            #look up the nset counter for the referenced nset (based on the surface)
-            tie_nset_id = nset_data['id'] if nset_data else 0
-            if tie_nset_id == 0:
-                nodes_to_tie = f"{surface_for_nodes}___originalnodeset"
-                nset_data = nsets.get(nodes_to_tie)
-                #look up the nset counter for the referenced nset (based on original nodeset)
-                tie_nset_id = nset_data['id'] if nset_data else 0
-            #look up the surf counter for the referenced main surface
-            tie_surf_id = surf_name_to_id.get(surface_to_tie_to, 0)
+            tie_nset_id, node_source = resolve_node_group(surface_for_nodes)
+            tie_surf_id, main_is_nodes = resolve_surface(surface_to_tie_to)
+            if node_source != f"{surface_for_nodes}___nodes" and tie_nset_id:
+                print(f"### WARNING ###: tie '{tied_contact_name}' uses raw/fallback "
+                      f"node group '{node_source}'")
+            if main_is_nodes:
+                print(f"### WARNING ###: tie '{tied_contact_name}' uses node group "
+                      f"'{surface_to_tie_to}' as the main surface; this is an "
+                      "approximation of a node-based surface")
+
             tie_holder = []
             if radversion == 2025:
-                if tc_type == "node to surface" and tie_surf_id != 0 and tie_nset_id != 0:
-                    inter_id += 1 # Increment the inter_id
-                    #create the tie for each node to surface pair (nodes for surf 1, surfs for surf 2)
+                if tc_type == "node to surface" and tie_surf_id and tie_nset_id:
+                    inter_id += 1
                     tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                     tie_holder.append(f"#Tied interface definition (n2s): {tied_contact_name}")
                     tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
@@ -4064,26 +4307,30 @@ def convert_ties(input_lines, surf_name_to_id, nsets, inter_id):
                     tie_holder.append("                   0                   0                             0")
 
                 elif tc_type == "surface to surface":
-                    #create surf to surf type tied contact
-                    s2s_main_surface = contact_groups[1].strip()
-                    s2s_second_surface = contact_groups[0].strip()
-                    s2s_main_surf_id = surf_name_to_id.get(s2s_main_surface, 0) #look up the surf counter for the referenced surface
-                    s2s_second_surf_id = surf_name_to_id.get(s2s_second_surface, 0) #look up the surf counter for the referenced surface
-                    if s2s_main_surf_id != 0 and s2s_second_surf_id != 0:
-                        inter_id += 1 # Increment the inter_id
+                    s2s_main_id, main_nodes = resolve_surface(surface_to_tie_to)
+                    s2s_second_id, second_nodes = resolve_surface(surface_for_nodes)
+                    if s2s_main_id and s2s_second_id:
+                        inter_id += 1
                         tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                         tie_holder.append(f"#Tied interface definition (s2s): {tied_contact_name}")
                         tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                         tie_holder.append(f"/INTER/TYPE2/{inter_id}\n{tied_contact_name}")
                         tie_holder.append("# Grnd_IDs  Surf_IDm    Ignore  Spotflag     Level   Isearch     Idel2  Surf_IDs             dSearch")
-                        tie_holder.append(f"         0{s2s_main_surf_id:>10}         3        {spotflag_default:>2}         0         0         2{s2s_second_surf_id:>10}          {tc_postol_value:>10.8g}")
+                        tie_holder.append(f"         0{s2s_main_id:>10}         3        {spotflag_default:>2}         0         0         2{s2s_second_id:>10}          {tc_postol_value:>10.8g}")
                         tie_holder.append("#              Stfac                Visc                          Istf")
                         tie_holder.append("                   0                   0                             0")
+                    else:
+                        print(f"### WARNING ###: surface-to-surface tie "
+                              f"'{tied_contact_name}' has unresolved surface(s); skipped")
+
+                if not tie_holder:
+                    print(f"### WARNING ###: tie '{tied_contact_name}' of type "
+                          f"'{tc_type}' could not be converted (nset={tie_nset_id}, "
+                          f"surf={tie_surf_id}); skipped")
 
             elif radversion == 2023:
-                if tie_surf_id != 0 and tie_nset_id != 0:
-                    inter_id += 1 # Increment the inter_id
-                    #create the first tie for each surface pair (nodes for surf 1, surfs for surf 2)
+                if tie_surf_id and tie_nset_id:
+                    inter_id += 1
                     tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                     tie_holder.append(f"#Tied interface definition: {tied_contact_name}")
                     tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
@@ -4094,35 +4341,34 @@ def convert_ties(input_lines, surf_name_to_id, nsets, inter_id):
                     tie_holder.append("                   0                   0                             0")
 
                 if tc_type == "surface to surface":
-                    #create a symmetric tie for each surf pair if type is surf - surf (surfs for surf 1, nodes for surf 2)
-                    symm_surface_for_nodes = contact_groups[1].strip()
-                    symm_surface_to_tie_to = contact_groups[0].strip()
-                    symm_nodes_to_tie = f"{symm_surface_for_nodes}___nodes"
-                    nset_data = nsets.get(symm_nodes_to_tie)
-                    symm_tie_nset_id = nset_data['id'] if nset_data else 0 #look up the nset counter for the referenced nset (based on the surface)
-                    symm_tie_surf_id = surf_name_to_id.get(symm_surface_to_tie_to, 0) #look up the surf counter for the referenced surface
-                    if symm_tie_surf_id != 0 and symm_tie_nset_id != 0:
-                        inter_id += 1 # Increment the inter_id
+                    symm_nset_id, _ = resolve_node_group(surface_to_tie_to)
+                    symm_surf_id, _ = resolve_surface(surface_for_nodes)
+                    if symm_surf_id and symm_nset_id:
+                        inter_id += 1
                         tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                         tie_holder.append(f"#Tied interface definition (symm for s2s): {tied_contact_name}")
                         tie_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                         tie_holder.append(f"/INTER/TYPE2/{inter_id}\n{tied_contact_name}_symm")
                         tie_holder.append("#  Grnd_ID   Surf_id    Ignore  Spotflag     Level   Isearch     Idel2                       dSearch")
-                        tie_holder.append(f"{symm_tie_nset_id:>10}{symm_tie_surf_id:>10}         3        {spotflag_default:>2}         0         0         2                    {tc_postol_value:>10.8g}")
+                        tie_holder.append(f"{symm_nset_id:>10}{symm_surf_id:>10}         3        {spotflag_default:>2}         0         0         2                    {tc_postol_value:>10.8g}")
                         tie_holder.append("#              Stfac                Visc                          Istf")
                         tie_holder.append("                   0                   0                             0")
 
             tied_contacts.extend(tie_holder)
-
-        elif tied_contact_name and line.startswith('*'):
+            # Consume this tie; the next data line cannot reuse it.
             tied_contact_name = None
+            i += 1
+            continue
+
+        if line.startswith('*') and tied_contact_name:
+            print(f"### WARNING ###: *TIE '{tied_contact_name}' has no surface "
+                  "pair data; skipped")
+            tied_contact_name = None
+        i += 1
 
     return tied_contacts, inter_id
 
 
-####################################################################################################
-# Function to convert amplitudes to functions                                                      #
-####################################################################################################
 def read_amplitudes(input_lines, fct_id):
     functs_dict = {}
     inside_amplitude_section = False
@@ -5179,6 +5425,11 @@ def convert_rigids(
     rigid_part = False
     rigid_nset = False
     rigid_elset = False
+    # P0: these were previously referenced before assignment for a
+    # *RIGID BODY with neither ELSET= nor NSET=, raising UnboundLocalError.
+    property_name = None
+    rbody_id = None
+    ref_nset_counter = 0
 
     if mpc_rigids:
         for nodeset, refnode in mpc_rigids:
@@ -5190,6 +5441,15 @@ def convert_rigids(
     while i < len(input_lines):
         line = input_lines[i]
         if line.lower().strip().startswith('*rigid body'):
+            # P0 (review): reset per-block state so a malformed block can
+            # never inherit an ELSET/REF NODE from the previous rigid body.
+            property_name = None
+            rbody_id = None
+            ref_nset_counter = 0
+            part_id = None
+            rigid_part = False
+            rigid_nset = False
+            rigid_elset = False
 
             propmatch = re.search(prop_pattern, line, re.IGNORECASE)
             if propmatch:
@@ -5226,6 +5486,19 @@ def convert_rigids(
 
             else:
                 rbody_id = None  # or handle the case where the pattern is not found
+
+            # P0: warn and skip incomplete rigid-body definitions instead of
+            # crashing on an uninitialised property name / reference node.
+            if property_name is None:
+                print("### WARNING ###: *RIGID BODY has neither ELSET= nor "
+                      "NSET=; it cannot be converted and is skipped.")
+                i += 1
+                continue
+            if rbody_id is None:
+                print("### WARNING ###: *RIGID BODY for "
+                      f"'{property_name}' has no REF NODE; it is skipped.")
+                i += 1
+                continue
 
             rgdrho = 7.8E-9  # default density for rigid bodies if not specified
             # Check for density field in the *RIGID BODY line
@@ -5424,7 +5697,10 @@ def convert_coupling(input_lines, nsets, max_elem_id):
                 rbody_id = coupling_rbodyid_match.group(1).strip()
                 continue
             coupling_name = f"KINEMATIC COUPLING for REF NODE {rbody_id}"
-            coupling_surf = f"{line.strip()}"
+            # P0: convert_nsets stores the node list of a *KINEMATIC COUPLING
+            # under this generated name.  Using the raw data line as the
+            # lookup key never matched it, so kinematic couplings were lost.
+            coupling_surf = f"NODES_FOR_KC_WITH_REF_NODE_{rbody_id}"
 
         if couplingk or kcoupling:
             if not rbody_id.isdigit():
@@ -5492,8 +5768,13 @@ def convert_coupling(input_lines, nsets, max_elem_id):
                 coupling_holder.append("                   0                   0                   0")
                 coupling_holder.append("#  Ioptoff   Iexpams")
                 coupling_holder.append("         0         0")
-                couplingk = False
-                kcoupling = False
+            else:
+                print("### WARNING ###: coupling "
+                      f"'{coupling_name}' references no known node set; "
+                      "the coupling is skipped.")
+            # P0: always clear the state after a coupling has been consumed.
+            couplingk = False
+            kcoupling = False
 
     return coupling_holder, max_elem_id
 
@@ -5516,6 +5797,7 @@ def convert_discoup(input_lines, nsets, max_elem_id):
 
         if line.startswith("*DISCOUP"):
             id_match = re.search(r'ID\s*=\s*([^,]+)', line, re.IGNORECASE)  # Extract ID value from the current line
+            id_value = None
             if id_match:
                 id_value = id_match.group(1).strip()
 
@@ -5582,21 +5864,52 @@ def convert_discoup(input_lines, nsets, max_elem_id):
                 if refnodesetmatch:
                     in_nset_block = True  # Start reading numbers in subsequent
 
-        if id_value:
+        # P0 (review): validate all weight rows BEFORE emitting the header.
+        # The old code wrote N_set=num_nodeset_lines even when every row was
+        # skipped, producing an /RBE3 card with no weight rows.
+        valid_weights = []
+        for nodeset_line in nodeset_lines:
+            fields = [field.strip() for field in nodeset_line.split(',')]
+            if len(fields) < 2:
+                print("### WARNING ###: malformed *DISCOUP weight line "
+                      f"'{nodeset_line.strip()}'; skipped.")
+                continue
+            nodeset_name = fields[0]
+            try:
+                weight = float(fields[1])
+            except ValueError:
+                print("### WARNING ###: non-numeric *DISCOUP weight "
+                      f"'{fields[1]}'; skipped.")
+                continue
+            nset_data = nsets.get(nodeset_name)
+            if nset_data is None:
+                print("### WARNING ###: *DISCOUP references unknown NSET "
+                      f"'{nodeset_name}'; this weight is skipped.")
+                continue
+            valid_weights.append((weight, nset_data['id']))
 
-            discoup_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            discoup_holder.append(f"# RBE3 for Coupling {discoup_name}")
-            discoup_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-            discoup_holder.append(f"/RBE3/{id_value}")
-            discoup_holder.append(f"{discoup_name}")
-            discoup_holder.append("# Node_IDr Trarotref     N_set   I_modif")
-            discoup_holder.append(f"{ref_node:>10}          {num_nodeset_lines:>10}         1")
-            discoup_holder.append("#                WTi Trarot_Mi  skew_Idi  grnd_IDi")
-            for nodeset_line in nodeset_lines:
-                nodeset_name, weight = nodeset_line.split(',')
-                weight = float(weight)
-                nodeset_id = nsets.get(nodeset_name)['id']
-                discoup_holder.append(f"{weight:>20.8g}   111 000          {nodeset_id:>10}")
+        if not id_value:
+            continue
+        if not valid_weights:
+            print("### WARNING ###: *DISCOUP "
+                  f"'{discoup_name}' has no valid weight rows; /RBE3 skipped.")
+            continue
+        if len(valid_weights) != num_nodeset_lines:
+            print("### WARNING ###: *DISCOUP "
+                  f"'{discoup_name}' declared {num_nodeset_lines} weight "
+                  f"row(s) but only {len(valid_weights)} were valid; using "
+                  f"N_set={len(valid_weights)}.")
+
+        discoup_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        discoup_holder.append(f"# RBE3 for Coupling {discoup_name}")
+        discoup_holder.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        discoup_holder.append(f"/RBE3/{id_value}")
+        discoup_holder.append(f"{discoup_name}")
+        discoup_holder.append("# Node_IDr Trarotref     N_set   I_modif")
+        discoup_holder.append(f"{ref_node:>10}          {len(valid_weights):>10}         1")
+        discoup_holder.append("#                WTi Trarot_Mi  skew_Idi  grnd_IDi")
+        for weight, nodeset_id in valid_weights:
+            discoup_holder.append(f"{weight:>20.8g}   111 000          {nodeset_id:>10}")
 
 
     return discoup_holder, max_elem_id
@@ -5785,6 +6098,8 @@ def convert_mpc_ties(input_lines, prop_id, max_elem_id):
     spring_rk = e_magnitude * 7                      #    Spring Stiffnesses and densities are based
     spring_mass = rho_magnitude * 1                  #        on material values from model
     spring_inertia = rho_magnitude * 1.5             #
+    # P0: the module defaults are also used when the deck has no material.
+    default_calibration = (e_magnitude == 10.0 and rho_magnitude == 1e-9)
 
     mpc_ties = []
     mpc_rigids = []
@@ -5853,37 +6168,55 @@ def convert_mpc_ties(input_lines, prop_id, max_elem_id):
     mpc_ties.append(f"/SPRING/{prop_id}")
     mpc_ties.append("#  Sprg_ID  NodeID_1  NodeID_2")
 
+    unsupported_mpc_types = set()
     for line in input_lines:
-        mpc_type_pattern = r'^\s*\*MPC?' # Regular expression to find '*MPC' contact entry
+        mpc_type_pattern = r'^\s*\*MPC\b'  # P0: require the full *MPC keyword
         matchmpc = re.search(mpc_type_pattern, line, re.IGNORECASE)
 
         if matchmpc:
-            # Extract tied contact name from the current line
             processing_mpcs = True
-            continue #(skip the *MPC line itself)
+            continue  # skip the *MPC header line itself
 
         if processing_mpcs and line.startswith('*'):
             processing_mpcs = False
 
         if processing_mpcs and not line.startswith('*'):
-            mpcdata = line.split(",")  # Split the line by comma
-            mpc_type = mpcdata[0].strip()
-            mpc_node_1 = mpcdata[1].strip()
-            mpc_node_2 = mpcdata[2].strip()
-            max_elem_id += 1 # Increment the max elem_id
+            mpcdata = [field.strip() for field in line.split(',')]
+            if len(mpcdata) < 3 or not mpcdata[1] or not mpcdata[2]:
+                print(f"### WARNING ###: malformed *MPC line '{line.strip()}'; skipped")
+                continue
+            mpc_type = mpcdata[0].lower()
+            mpc_node_1, mpc_node_2 = mpcdata[1], mpcdata[2]
+            max_elem_id += 1  # Increment the max elem_id
 
             #create a spring for each .inp TIE *MPC)
-            if mpc_type.lower() == 'tie':
+            if mpc_type == 'tie':
                 mpc_ties.append(f"{max_elem_id:>10}{mpc_node_1:>10}{mpc_node_2:>10}")
                 some_ties = True
 
-            elif mpc_type.lower() == 'beam':
-                # Create a rigid body for each .inp BEAM *MPC)
+            elif mpc_type in ('beam', 'hinge', 'pin'):
+                # P1: BEAM/HINGE/PIN are all represented as rigid links; the
+                # rotational release of HINGE/PIN cannot be represented by a
+                # Radioss RBODY, so warn rather than claim exact equivalence.
+                if mpc_type in ('hinge', 'pin'):
+                    print(f"### WARNING ###: *MPC {mpc_type.upper()} is converted "
+                          "as a rigid link; rotational releases are not preserved.")
                 mpc_rigids.append((mpc_node_1, mpc_node_2))
+
+            else:
+                unsupported_mpc_types.add(mpcdata[0])
+
+    for mpc_type in sorted(unsupported_mpc_types):
+        print(f"### WARNING ###: unsupported *MPC type '{mpc_type}'; dropped.")
 
     if not some_ties:
         # If no MPC ties were found, data block for spring ties is cleared
         mpc_ties = []
+
+    if (some_ties or mpc_rigids) and default_calibration:
+        print("### WARNING ###: *MPC connections were calibrated with default "
+              "E=10.0 / rho=1e-9 because no material stiffness/density was "
+              "found in the deck. Verify the /PROP/TYPE13 spring values.")
 
     return mpc_ties, mpc_rigids, prop_id, max_elem_id
 
