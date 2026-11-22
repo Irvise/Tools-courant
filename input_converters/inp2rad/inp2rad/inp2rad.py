@@ -21,6 +21,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import sys
 import re
+import math
 import time
 import argparse
 
@@ -4123,66 +4124,314 @@ def convert_ties(input_lines, surf_name_to_id, nsets, inter_id):
 ####################################################################################################
 # Function to convert amplitudes to functions                                                      #
 ####################################################################################################
+####################################################################################################
+# Shared helpers for boundary conditions, loads, amplitudes and initial conditions                   #
+####################################################################################################
+def get_keyword_param(header, name):
+    """Return a keyword parameter value, tolerating spaces and trailing commas.
+
+    Quoted values are matched first so that a comma inside the quotes is not
+    treated as the end of the parameter.
+    """
+    quoted = re.search(r'\b' + re.escape(name) + r'\s*=\s*"([^"]*)"', header, re.IGNORECASE)
+    if quoted:
+        return quoted.group(1).strip()
+    unquoted = re.search(r'\b' + re.escape(name) + r'\s*=\s*([^,]+?)\s*(?:,|$)', header, re.IGNORECASE)
+    return unquoted.group(1).strip() if unquoted else None
+
+
+def parse_step_info(input_lines):
+    """Return a list of {'start', 'period'} step time ranges found in the deck.
+
+    Abaqus step times are local to each step; Radioss uses one global time.  The
+    cumulative start/period values returned here are used to map amplitude time
+    and to populate Tstart/Tstop on imposed conditions.
+    """
+    steps = []
+    # A *STATIC/*DYNAMIC line is followed by its step time on the next data line.
+    i = 0
+    while i < len(input_lines):
+        stripped = input_lines[i].strip()
+        if stripped.lower().startswith('*static') or stripped.lower().startswith('*dynamic'):
+            if i + 1 < len(input_lines):
+                data = input_lines[i + 1].strip()
+                if data and not data.startswith('*'):
+                    try:
+                        period = float(data.split(',')[0].strip())
+                    except ValueError:
+                        period = None
+                    if period is not None:
+                        start = steps[-1]['start'] + steps[-1]['period'] if steps else 0.0
+                        steps.append({'start': start, 'period': period})
+                        i += 1
+        i += 1
+    return steps
+
+
+def step_range(steps, step_index):
+    """Global (start, stop) time of a step, falling back to (0, 1E31)."""
+    if 0 <= step_index < len(steps):
+        step = steps[step_index]
+        return step['start'], step['start'] + step['period']
+    return 0.0, 1e31
+
+
+def warn_missing_nset(name, context):
+    print(f"### WARNING ###: Unresolved node set '{name}' in {context}; entry skipped.")
+    print("                 Define the NSET in the .inp deck before using it in a load or BC.")
+
+
+def resolve_function_id(amplitude_name, functs_dict, context, fct_id, step_start=0.0):
+    """Resolve a function ID for an amplitude name.
+
+    Unknown amplitudes are *not* silently mapped to function 1: a warning is
+    printed and the default constant function is used.  For later steps the
+    amplitude abscissae are shifted by the cumulative step start time so that
+    the curve remains correct on the single Radioss time axis.
+
+    Returns (function_id, updated_fct_id).
+    """
+    name = amplitude_name or 'DEFAULT CONSTANT OVER STEP'
+    if name not in functs_dict:
+        print(f"### WARNING ###: Unknown amplitude '{name}' referenced by {context}; "
+              "using the constant default instead.")
+        name = 'DEFAULT CONSTANT OVER STEP'
+    if name not in functs_dict:
+        # Extremely defensive: the default should always exist.
+        fct_id += 1
+        functs_dict[name] = {'id': fct_id, 'data': [(0.0, 1.0), (1.0, 1.0)]}
+    if step_start > 0.0:
+        shifted_name = f"{name}__step_t{step_start:g}"
+        if shifted_name not in functs_dict:
+            fct_id += 1
+            functs_dict[shifted_name] = {
+                'id': fct_id,
+                'data': [(t + step_start, value) for t, value in functs_dict[name]['data']],
+                'definition': functs_dict[name].get('definition', 'TABULAR'),
+            }
+        return functs_dict[shifted_name]['id'], fct_id
+    return functs_dict[name]['id'], fct_id
+
+
+def build_system_skews(input_lines):
+    """Build /SKEW/FIX cards from *SYSTEM definitions for BC/load directions.
+
+    Only rectangular systems (two coordinate lines) can be represented.  The
+    system number is reused as the skew ID so BC/load cards can point at it.
+    """
+    skew_blocks = []
+    i = 0
+    system_id = None
+    warned = False
+    while i < len(input_lines):
+        line = input_lines[i].strip()
+        if line.lower().startswith('*system'):
+            id_match = re.search(r'\bID\s*=\s*(\d+)', line, re.IGNORECASE)
+            system_id = int(id_match.group(1)) if id_match else len(skew_blocks) + 1
+            if not warned:
+                print("### WARNING ###: *SYSTEM parameters (for example TYPE) are discarded "
+                      "during preprocessing; rectangular coordinate data is preserved as /SKEW/FIX "
+                      "and BC/load cards still default to the global frame unless SYSTEM=n is used.")
+                warned = True
+            i += 1
+            if i >= len(input_lines):
+                break
+            first = input_lines[i].strip()
+            second = input_lines[i + 1].strip() if i + 1 < len(input_lines) else ''
+            try:
+                coords = [float(v) for v in first.split(',') if v.strip()]
+                second_coords = [float(v) for v in second.split(',') if v.strip()] if second and not second.startswith('*') else []
+            except ValueError:
+                coords = []
+                second_coords = []
+            if len(coords) >= 6:
+                origin = coords[0:3]
+                x1 = [coords[3] - origin[0], coords[4] - origin[1], coords[5] - origin[2]]
+                if len(second_coords) >= 3:
+                    x2 = [second_coords[0] - origin[0],
+                          second_coords[1] - origin[1],
+                          second_coords[2] - origin[2]]
+                else:
+                    # Fall back to the next global axis when no XY point is given.
+                    axis = min(range(3), key=lambda k: abs(x1[k]))
+                    x2 = [1.0 if k == axis else 0.0 for k in range(3)]
+                if any(abs(v) > 1e-14 for v in x1) and any(abs(v) > 1e-14 for v in x2):
+                    block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                    block += f"/SKEW/FIX/{system_id}\nSkew from *SYSTEM {system_id}\n"
+                    block += "#                 OX                  OY                  OZ\n"
+                    block += "".join(f"{v:>20.8f}" for v in origin) + "\n"
+                    block += "#                 X1                  Y1                  Z1\n"
+                    block += "".join(f"{v:>20.8f}" for v in x1) + "\n"
+                    block += "#                 X2                  Y2                  Z2\n"
+                    block += "".join(f"{v:>20.8f}" for v in x2)
+                    skew_blocks.append(block)
+                else:
+                    print(f"### WARNING ###: Degenerate *SYSTEM {system_id}; skew card not written.")
+            else:
+                print(f"### WARNING ###: *SYSTEM {system_id} has no rectangular definition; skew card not written.")
+        i += 1
+    return skew_blocks
+
+
+def sample_smooth_step(points, samples_per_interval=20):
+    """Sample an Abaqus SMOOTH STEP amplitude into linear /FUNCT points.
+
+    Abaqus uses the quintic polynomial xi^3 * (10 - 15*xi + 6*xi^2), not the
+    cubic Hermite form; at xi=0.25 this gives ~= 0.1035.
+    """
+    xy = []
+    for (t0, a0), (t1, a1) in zip(points, points[1:]):
+        if t1 <= t0:
+            continue
+        if not xy:
+            xy.append((t0, a0))
+        for k in range(1, samples_per_interval + 1):
+            s = float(k) / samples_per_interval
+            smooth = s ** 3 * (10.0 - 15.0 * s + 6.0 * s ** 2)
+            xy.append((t0 + (t1 - t0) * s, a0 + (a1 - a0) * smooth))
+    return xy
+
+
+def sample_exponential(values, samples=20):
+    """Sample legacy Abaqus EXPONENTIAL amplitude (A0,t0,A1,t1,c)."""
+    if len(values) < 5:
+        return []
+    a0, t0, a1, t1, c = values[:5]
+    if c <= 0.0 or t1 <= t0:
+        return [(t0, a0), (t1, a1)]
+    xy = [(t0, a0)]
+    for k in range(1, samples + 1):
+        t = t0 + (t1 - t0) * float(k) / samples
+        xy.append((t, a0 + (a1 - a0) * (1.0 - math.exp(-c * (t - t0)))))
+    xy.append((t1, a1))
+    return xy
+
+
+def sample_decay(values, samples=20):
+    """Sample Abaqus DECAY amplitude (A0, A, t0, decay_time).
+
+    The amplitude is the constant A0 for t < t0 and jumps to A0 + A at t0,
+    then decays towards A0.
+    """
+    if len(values) < 4:
+        return []
+    a0, amplitude, t0, decay = values[:4]
+    t0 = max(0.0, t0)
+    xy = []
+    if t0 > 0.0:
+        xy.extend([(0.0, a0), (t0, a0)])
+    if decay <= 0.0:
+        xy.append((t0, a0 + amplitude))
+        return xy
+    end = t0 + 5.0 * decay
+    for k in range(samples + 1):
+        t = t0 + (end - t0) * float(k) / samples
+        xy.append((t, a0 + amplitude * math.exp(-(t - t0) / decay)))
+    return xy
+
+
+def sample_aggregate(points):
+    """Sample Abaqus AGGREGATE amplitude (A, T) pairs into a step curve."""
+    xy = [(0.0, 0.0)]
+    total = 0.0
+    for magnitude, time in sorted(points, key=lambda pair: pair[1]):
+        xy.append((time, total))
+        total += magnitude
+        xy.append((time, total))
+    return xy
+
+
+####################################################################################################
+# Function to read *AMPLITUDE definitions into Radioss /FUNCT data                                   #
+####################################################################################################
 def read_amplitudes(input_lines, fct_id):
     functs_dict = {}
-    inside_amplitude_section = False
-    amplitude_name = None
-    data_blocks = []
-    current_data_block = []
+    blocks = []
+    current_block = None
 
-    # Loop over all input lines
     for line in input_lines:
-        line = line.strip()
-        # Detect *AMPLITUDE section
-        if line.lower().startswith('*amplitude'):
-            inside_amplitude_section = True
-            if current_data_block:
-                data_blocks.append(current_data_block)
-            current_data_block = [line]
+        stripped = line.strip()
+        if stripped.lower().startswith('*amplitude'):
+            if current_block is not None:
+                blocks.append(current_block)
+            current_block = {'header': stripped, 'data': []}
+            continue
+        if current_block is not None:
+            if stripped.startswith('*'):
+                blocks.append(current_block)
+                current_block = None
+            elif stripped and not stripped.startswith('**'):
+                current_block['data'].append(stripped)
+    if current_block is not None:
+        blocks.append(current_block)
 
-        elif inside_amplitude_section and not line.startswith('*'):
-            current_data_block.append(line)
+    for block in blocks:
+        header = block['header']
+        amplitude_name = get_keyword_param(header, 'NAME') or f'AMPLITUDE_{len(functs_dict) + 1}'
+        definition = (get_keyword_param(header, 'DEFINITION')
+                      or get_keyword_param(header, 'TYPE') or 'TABULAR').upper()
+        values = []
+        for data_line in block['data']:
+            values.extend(float(value) for value in re.split(r'[,\s]+', data_line) if value.strip())
 
-        elif line.startswith('*'):
-            inside_amplitude_section = False
+        if definition in ('SMOOTH STEP', 'SMOOTH_STEP'):
+            points = list(zip(values[::2], values[1::2]))
+            xy = sample_smooth_step(points)
+        elif definition in ('EXPONENTIAL', 'AGGREGATE', 'DECAY'):
+            points = list(zip(values[::2], values[1::2]))
+            if definition == 'EXPONENTIAL':
+                xy = sample_exponential(values)
+            elif definition == 'DECAY':
+                xy = sample_decay(values)
+            else:
+                xy = sample_aggregate(points)
+        elif definition == 'EQUALLY SPACED':
+            interval_match = re.search(r'\bFIXED\s+INTERVAL\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', header, re.IGNORECASE)
+            begin_match = re.search(r'\bBEGIN\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', header, re.IGNORECASE)
+            if not interval_match:
+                print(f"### WARNING ###: EQUALLY SPACED amplitude '{amplitude_name}' has no FIXED INTERVAL; "
+                      "using the constant default.")
+                xy = [(0.0, 1.0), (1.0, 1.0)]
+            else:
+                interval = float(interval_match.group(1))
+                begin = float(begin_match.group(1)) if begin_match else 0.0
+                xy = [(begin + index * interval, value) for index, value in enumerate(values)]
+        elif definition == 'TABULAR':
+            if len(values) % 2:
+                print(f"### WARNING ###: Uneven data in amplitude '{amplitude_name}', ignoring the last value.")
+                values = values[:-1]
+            xy = list(zip(values[::2], values[1::2]))
+        else:
+            print(f"### WARNING ###: Amplitude '{amplitude_name}' uses unsupported form "
+                  f"'{definition}'; using the constant default.")
+            xy = [(0.0, 1.0), (1.0, 1.0)]
 
-    if current_data_block:
-        data_blocks.append(current_data_block)
-
-    for block in data_blocks:
-        header = block[0]
-        # Extract the name of the amplitude using regex
-        amplitude_name_match = re.search(r"name\s*=\s*([\w\-\.]+)", header, re.IGNORECASE)
-        amplitude_name = amplitude_name_match.group(1)
+        if not xy:
+            print(f"### WARNING ###: No usable data in amplitude '{amplitude_name}'; using constant default.")
+            xy = [(0.0, 1.0), (1.0, 1.0)]
         fct_id += 1
-
-        data = " ".join(block[1:])  # Combine all lines of data
-
-        data = re.sub(r",\s*$", "", data)  # Remove trailing comma
-        values = [float(v) for v in re.split(r"[,\s]+", data) if v]  # Split and convert to float
-
-        if len(values) % 2 != 0:
-            print("### WARNING ###: Uneven data in block, ignoring the last value.")
-            values = values[:-1]
-
         functs_dict[amplitude_name] = {
             'id': fct_id,
-            'data': list(zip(values[::2], values[1::2]))
-            }
+            'data': xy,
+            'definition': definition,
+        }
 
-    # Always create a default amplitude at the end for use where one isn't called
-    fct_id += 1  # Increment fct_id for the default amplitude
+    # Always create a default amplitude for loads/BCs without an AMPLITUDE reference.
+    fct_id += 1
     default_amplitude_name = 'DEFAULT CONSTANT OVER STEP'
     functs_dict[default_amplitude_name] = {
         'id': fct_id,
-        'data': [(0.0, 1.0), (1.0, 1.0)]  # Default data as (abscissa, ordinate) pairs
+        'data': [(0.0, 1.0), (1.0, 1.0)],
+        'definition': 'TABULAR',
     }
-
     return functs_dict, fct_id
 
 
 ####################################################################################################
 # Function to convert BOUNDARY and CLOAD data, BCS, CLOAD and IMPDISPS only for now                #
+####################################################################################################
+####################################################################################################
+# Function to convert BOUNDARY and CLOAD data, BCS, IMPDISPS, IMPVELS and CLOADs                     #
 ####################################################################################################
 def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
     boundary_data = {}
@@ -4194,491 +4443,295 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
     amplitude_name = None
     opsection = False
     imptype = 'DISPLACEMENT'
+    skew_id = 0
+    # -1 means "before the first *STEP"; parse_step_info() returns 0-based
+    # steps, so step 1 maps to index 0.
+    step_index = -1
 
-    op_pattern = r'op\s*=\s*new'
-    amplitude_pattern = r'amplitude\s*=\s*([^ ]+)'
-    type_pattern = r'type\s*=\s*([^ ]+)'
+    steps = parse_step_info(input_lines)
+    if len(steps) > 1:
+        print("### WARNING ###: Multiple steps found. Amplitude time is mapped to the global "
+              "Radioss time using cumulative step starts (approximation).")
+    elif any(line.strip().lower().startswith('*step') for line in input_lines) and not steps:
+        print("### WARNING ###: *STEP time could not be parsed; imposed conditions keep "
+              "Tstart=0 and Tstop=1E31.")
 
-    # Define boundary condition mappings for text entry boundary conditions
+    # Parameters may be followed by a comma, e.g. "TYPE=VELOCITY," or "OP=NEW".
+    amplitude_pattern = r'\bAMPLITUDE\s*=\s*"?([^",\s]+)"?'
+    type_pattern = r'\bTYPE\s*=\s*"?([^",\s]+)"?'
+    op_pattern = r'\bOP\s*=\s*NEW\b'
+    system_pattern = r'\bSYSTEM\s*=\s*"?([^",\s]+)"?'
+
+    # Predefined symmetry / support conditions.  Entries are the six BCS DOFs.
     boundary_condition_mappings = {
         'ENCASTRE': ['1', '2', '3', '4', '5', '6'],
+        'ENCASTR': ['1', '2', '3', '4', '5', '6'],
         'PINNED': ['1', '2', '3', '0', '0', '0'],
         'XSYMM': ['1', '0', '0', '0', '5', '6'],
         'YSYMM': ['0', '2', '0', '4', '0', '6'],
-        'ZSYMM': ['0', '0', '3', '4', '5', '0']
+        'ZSYMM': ['0', '0', '3', '4', '5', '0'],
+        'XSIDE': ['1', '0', '0', '0', '0', '0'],
+        'YSIDE': ['0', '2', '0', '0', '0', '0'],
+        'ZSIDE': ['0', '0', '3', '0', '0', '0'],
+        'XSPHERE': ['0', '2', '3', '0', '0', '0'],
+        'YSPHERE': ['1', '0', '3', '0', '0', '0'],
+        'ZSPHERE': ['1', '2', '0', '0', '0', '0'],
     }
 
-    for line in input_lines:
+    def direction_label(field):
+        return {
+            '1': 'X', '2': 'Y', '3': 'Z',
+            '4': 'XX', '5': 'YY', '6': 'ZZ',
+        }.get(str(field).strip())
+
+    def clear_entries(target_dict, name):
+        for store in (boundary_data, impd_data, impv_data, cload_data):
+            store.pop(name, None)
+        target_dict.pop(name, None)
+
+    def start_section(kind, header, default_type=None, default_amplitude=None):
+        nonlocal section, amplitude_name, imptype, opsection, skew_id
+        section = kind
+        opsection = bool(re.search(op_pattern, header, re.IGNORECASE))
+        type_match = re.search(type_pattern, header, re.IGNORECASE)
+        imptype = type_match.group(1).upper() if type_match else (default_type or 'DISPLACEMENT')
+        amp_match = re.search(amplitude_pattern, header, re.IGNORECASE)
+        amplitude_name = amp_match.group(1) if amp_match else (default_amplitude or 'DEFAULT CONSTANT OVER STEP')
+        system_match = re.search(system_pattern, header, re.IGNORECASE)
+        skew_id = int(system_match.group(1)) if system_match and system_match.group(1).isdigit() else 0
+
+    for line_number, line in enumerate(input_lines):
         line = line.strip()
+        if line.lower().startswith('*step'):
+            step_index += 1
 
-        if line.lower().startswith("*boundary") and re.search(r'type\s*=', line.lower()):
-            section = "*boundary"
-            type_match = re.search(type_pattern, line, re.IGNORECASE)
-            imptype = type_match.group(1).strip()  # Get the value after '=' and strip any spaces
-            amplitude_match = re.search(amplitude_pattern, line, re.IGNORECASE)
-            if amplitude_match:
-                amplitude_name = amplitude_match.group(1).strip()  # Get the value after '=' and strip any spaces
+        if line.lower().startswith('*boundary'):
+            if re.search(type_pattern, line, re.IGNORECASE):
+                start_section('*boundary', line)
             else:
-                amplitude_name = 'DEFAULT CONSTANT OVER STEP'
-            opsection = False
-
-            # Check for 'op=new' to clear existing data
-            if re.search(op_pattern, line.lower()):
-                # Clear existing data for this section
-                opsection = True
+                start_section('*boundary', line, default_type='DISPLACEMENT')
             continue
 
-        # Check for boundary or cload section
-        if line.lower().startswith("*boundary") and 'amplitude' not in line.lower():
-            section = "*boundary"
-            imptype = 'DISPLACEMENT'
-            amplitude_name = 'DEFAULT CONSTANT OVER STEP'  # Reset amplitude name for BCS boundaries
-            opsection = False
-
-            # Check for 'op=new' to clear existing data
-            if re.search(op_pattern, line.lower()):
-                # Clear existing data for this section
-                opsection = True
+        if line.lower().startswith('*cload'):
+            start_section('*cload', line)
             continue
 
-        if line.lower().startswith("*boundary") and re.search(r'amplitude\s*=', line.lower()):
-            section = "*boundary"
-            imptype = 'DISPLACEMENT'
-            amplitude_match = re.search(amplitude_pattern, line, re.IGNORECASE)
-            amplitude_name = amplitude_match.group(1).strip()  # Get the value after '=' and strip any spaces
-            opsection = False
-
-            # Check for 'op=new' to clear existing data
-            if re.search(op_pattern, line.lower()):
-                # Clear existing data for this section
-                opsection = True
-            continue
-
-        if line.lower().startswith("*cload") and re.search(r'amplitude\s*=', line.lower()):
-            section = "*cload"
-            amplitude_match = re.search(amplitude_pattern, line, re.IGNORECASE)
-            if amplitude_match:
-                amplitude_name = amplitude_match.group(1).strip()  # Get the value after '=' and strip any spaces
-            opsection = False
-
-            # Check for 'op=new' to clear existing data
-            if re.search(op_pattern, line.lower()):
-                # Clear existing data for this section
-                opsection = True
-            continue
-
-        if line.lower().startswith("*cload") and not re.search(r'amplitude\s*=', line.lower()):
-            section = "*cload"
-            amplitude_name = 'DEFAULT CONSTANT OVER STEP'  # set cload as constant if no amplitude defined
-            opsection = False
-
-            # Check for 'op=new' to clear existing data
-            if re.search(op_pattern, line.lower()):
-                # Clear existing data for this section
-                opsection = True
-            continue
-
-        if line.startswith("*"):
+        if line.startswith('*'):
             section = None
+            continue
 
-        elif section == "*boundary" and not line.startswith("*"):
-            fields = line.split(',')
-            fields = [f.strip() for f in fields]  # Clean up any extra whitespace
+        if section == '*boundary' and line:
+            fields = [field.strip() for field in line.split(',')]
+            if not fields or not fields[0]:
+                continue
+            name = fields[0]
 
-            if imptype == 'DISPLACEMENT':
+            if imptype not in ('DISPLACEMENT', 'VELOCITY'):
+                print(f"### WARNING ###: *BOUNDARY TYPE={imptype} is not supported; entry for '{name}' skipped.")
+                continue
 
-                if len(fields) >= 2 and not len(fields) >= 4:
-                    boundary_name = fields[0]  # First field
-                    boundary_dir1 = fields[1]  # Second field
+            if len(fields) < 2:
+                print(f"### WARNING ###: Incomplete *BOUNDARY entry for '{name}'; skipped.")
+                continue
 
-                    # Check if boundary_dir1 is a predefined string condition
-                    if boundary_dir1 in boundary_condition_mappings:
-                        boundary_dir = boundary_condition_mappings[boundary_dir1]
-                    else:
-                    # Otherwise, parse as integer ranges for boundary_dir1 and boundary_dir2
-                        boundary_dir1 = int(boundary_dir1)
-                        # Set the 3rd field to the 2nd field if it's empty
-                        boundary_dir2 = int(fields[2]) if len(fields) >= 3 and fields[2] != '' else boundary_dir1
-                        # Generate the list of directions for BCS (range between dir1 and dir2)
-                        boundary_dir = list(map(str, range(boundary_dir1, boundary_dir2 + 1)))
-
-                    # Store the BCS data
-                    if opsection is True:
-                        opsection = False
-                        if boundary_name in boundary_data:
-                            del boundary_data[boundary_name]
-                        if boundary_name in impd_data:
-                            del impd_data[boundary_name]
-                        if boundary_name in impv_data:
-                            del impv_data[boundary_name]
-
-                    if boundary_name not in boundary_data:
-                        boundary_data[boundary_name] = boundary_dir
-                    else:
-                        boundary_data[boundary_name].extend(boundary_dir)
-
-                if len(fields) >= 4:
-                    impd_name = fields[0]  # First field
-                    impd_dir = "X" if fields[1] == "1" else "Y" if fields[1] == "2" else "Z" if fields[1] == "3" else \
-                               "XX" if fields[1] == "4" else "YY" if fields[1] == "5" else "ZZ" if fields[1] == "6" else None
-                    impd_val = fields[3].strip() if fields[3] != '' else "0.0"  # Set 4th field to 0.0 if empty
-
+            dof_field = fields[1]
+            magnitude = 0.0
+            last_dof_field = None
+            if len(fields) >= 4:
+                last_dof_field = fields[2]
+                if fields[3].strip():
                     try:
-                        impd_val_float = float(impd_val)  # Convert to float
+                        magnitude = float(fields[3])
                     except ValueError:
-                        raise ValueError(f"Invalid value for impd_val: {impd_val}")
-
-                    # Check if impd_val is equivalent to 0.0
-                    if impd_val_float == 0.0:
-                        # Handle as BCS instead of IMPDISP
-                        if len(fields) >= 2:
-                            boundary_name = fields[0]  # First field
-                            boundary_dir1 = int(fields[1])  # Second field
-
-                            # Set the 3rd field to the 2nd field if it's empty
-                            boundary_dir2 = int(fields[2]) if len(fields) >= 3 and fields[2] != '' else boundary_dir1
-
-                            # Generate the list of directions for BCS (range between dir1 and dir2)
-                            boundary_dir = list(map(str, range(boundary_dir1, boundary_dir2 + 1)))
-
-                            if opsection is True:
-                                opsection = False
-                                if boundary_name in boundary_data:
-                                    del boundary_data[boundary_name]
-                                if boundary_name in impd_data:
-                                    del impd_data[boundary_name]
-                                if boundary_name in impv_data:
-                                    del impv_data[boundary_name]
-
-                            if boundary_name not in boundary_data:
-                                boundary_data[boundary_name] = boundary_dir
-                            else:
-                                boundary_data[boundary_name].extend(boundary_dir)
-
-                    else:
-                        # Continue treating as IMPDISP
-                        impd_val = float(impd_val)  # Convert value to float
-
-                        if opsection is True:
-                            opsection = False
-                            if impd_name in boundary_data:
-                                del boundary_data[impd_name]
-                            if impd_name in impd_data:
-                                del impd_data[impd_name]
-                            if impd_name in impv_data:
-                                del impv_data[impd_name]
-
-                        # If impd_name is already in the dictionary, append to its list
-                        if impd_name not in impd_data:
-                            impd_data[impd_name] = []
-
-                        # Add this entry to the list
-                        impd_data[impd_name].append((impd_dir, impd_val, amplitude_name))
-
-            elif imptype == 'VELOCITY':
-
-                if len(fields) >= 2 and not len(fields) >= 4:
-                    boundary_name = fields[0]  # First field
-                    boundary_dir1 = fields[1]  # Second field
-
-                    # Check if boundary_dir1 is a predefined string condition
-                    if boundary_dir1 in boundary_condition_mappings:
-                        boundary_dir = boundary_condition_mappings[boundary_dir1]
-                    else:
-                    # Otherwise, parse as integer ranges for boundary_dir1 and boundary_dir2
-                        boundary_dir1 = int(boundary_dir1)
-                        # Set the 3rd field to the 2nd field if it's empty
-                        boundary_dir2 = (
-                            int(fields[2])
-                            if len(fields) >= 3
-                            and fields[2] != ''
-                            else boundary_dir1
-                            )
-                        # Generate the list of directions for BCS (range between dir1 and dir2)
-                        boundary_dir = list(map(str, range(boundary_dir1, boundary_dir2 + 1)))
-
-                    # Store the BCS data
-                    if opsection is True:
-                        opsection = False
-                        if boundary_name in boundary_data:
-                            del boundary_data[boundary_name]
-                        if boundary_name in impd_data:
-                            del impd_data[boundary_name]
-                        if boundary_name in impv_data:
-                            del impv_data[boundary_name]
-
-                    if boundary_name not in boundary_data:
-                        boundary_data[boundary_name] = boundary_dir
-                    else:
-                        boundary_data[boundary_name].extend(boundary_dir)
-
-                if len(fields) >= 4:
-                    impv_name = fields[0]  # First field
-                    impv_dir = "X" if fields[1] == "1" else "Y" if fields[1] == "2" else "Z" if fields[1] == "3" else \
-                               "XX" if fields[1] == "4" else "YY" if fields[1] == "5" else "ZZ" if fields[1] == "6" else None
-                    impv_val = fields[3].strip() if fields[3] != '' else "0.0"  # Set 4th field to 0.0 if empty
-
-                    try:
-                        impv_val_float = float(impv_val)  # Convert to float
-                    except ValueError:
-                        raise ValueError(f"Invalid value for impv_val: {impv_val}")
-
-                    # Check if impv_val is equivalent to 0.0
-                    if impv_val_float == 0.0:
-                        # Handle as BCS instead of IMPDISP
-                        if len(fields) >= 2:
-                            boundary_name = fields[0]  # First field
-                            boundary_dir1 = int(fields[1])  # Second field
-
-                            # Set the 3rd field to the 2nd field if it's empty
-                            boundary_dir2 = int(fields[2]) if len(fields) >= 3 and fields[2] != '' else boundary_dir1
-
-                            # Generate the list of directions for BCS (range between dir1 and dir2)
-                            boundary_dir = list(map(str, range(boundary_dir1, boundary_dir2 + 1)))
-
-                            if opsection is True:
-                                opsection = False
-                                if boundary_name in boundary_data:
-                                    del boundary_data[boundary_name]
-                                if boundary_name in impd_data:
-                                    del impd_data[boundary_name]
-                                if boundary_name in impv_data:
-                                    del impv_data[boundary_name]
-
-                            if boundary_name not in boundary_data:
-                                boundary_data[boundary_name] = boundary_dir
-                            else:
-                                boundary_data[boundary_name].extend(boundary_dir)
-
-                    else:
-                        # Continue treating as IMPVEL
-                        impv_val = float(impv_val)  # Convert value to float
-
-                        if opsection is True:
-                            opsection = False
-                            if impv_name in boundary_data:
-                                del boundary_data[impv_name]
-                            if impv_name in impd_data:
-                                del impd_data[impv_name]
-                            if impv_name in impv_data:
-                                del impv_data[impv_name]
-
-                        # If impd_name is already in the dictionary, append to its list
-                        if impv_name not in impv_data:
-                            impv_data[impv_name] = []
-
-                        # Add this entry to the list
-                        impv_data[impv_name].append((impv_dir, impv_val, amplitude_name))
-
-        elif section == "*cload" and not line.startswith("*"):
-            fields = line.split(',')
-            fields = [f.strip() for f in fields]  # Clean up any extra whitespace
-
-            if len(fields) >= 3:
-                cload_name = fields[0]  # First field
-                cload_dir = "X" if fields[1] == "1" else "Y" if fields[1] == "2" else "Z" if fields[1] == "3" else \
-                           "XX" if fields[1] == "4" else "YY" if fields[1] == "5" else "ZZ" if fields[1] == "6" else None
-                cload_val = fields[2].strip() if fields[2] != '' else "0.0"  # Set 3rd field to 0.0 if empty
-
+                        print(f"### WARNING ###: Invalid *BOUNDARY magnitude '{fields[3]}' on '{name}'; skipped.")
+                        continue
+            elif len(fields) == 3 and imptype == 'VELOCITY':
+                # *BOUNDARY, TYPE=VELOCITY allows node, DOF, magnitude.
                 try:
-                    cload_val_float = float(cload_val)  # Convert to float
+                    magnitude = float(fields[2])
                 except ValueError:
-                    raise ValueError(f"Invalid value for cload_val: {cload_val}")
+                    last_dof_field = fields[2]
+            elif len(fields) == 3:
+                # Plain *BOUNDARY uses the third field as the last DOF of a range.
+                last_dof_field = fields[2]
+            if dof_field.upper() in boundary_condition_mappings and magnitude == 0.0:
+                boundary_dir = boundary_condition_mappings[dof_field.upper()]
+                target = boundary_data
+            else:
+                try:
+                    first_dof = int(float(dof_field))
+                    last_dof = (int(float(last_dof_field))
+                                if last_dof_field and last_dof_field.strip() else first_dof)
+                except ValueError:
+                    print(f"### WARNING ###: Invalid *BOUNDARY DOF '{dof_field}' for '{name}'; skipped.")
+                    continue
+                boundary_dir = list(map(str, range(first_dof, last_dof + 1)))
+                if magnitude == 0.0:
+                    target = boundary_data
+                else:
+                    target = impd_data if imptype == 'DISPLACEMENT' else impv_data
 
-                # create cload data
-                cload_val = float(cload_val)  # Convert value to float
+            if opsection:
+                opsection = False
+                clear_entries(target, name)
 
-                if opsection is True:
-                    opsection = False
-                    if cload_name in cload_data:
-                        del cload_data[cload_name]
+            if target is boundary_data:
+                if name not in boundary_data:
+                    boundary_data[name] = {'dirs': boundary_dir, 'skew': skew_id}
+                else:
+                    boundary_data[name]['dirs'].extend(boundary_dir)
+                    if skew_id:
+                        boundary_data[name]['skew'] = skew_id
+            else:
+                for dof in boundary_dir:
+                    label = direction_label(dof)
+                    if label is None:
+                        print(f"### WARNING ###: Unsupported DOF {dof} for imposed condition on '{name}'; skipped.")
+                        continue
+                    target.setdefault(name, []).append((label, magnitude, amplitude_name, step_index, skew_id))
+            continue
 
-                # If cload_name is already in the dictionary, append to its list
-                if cload_name not in cload_data:
-                    cload_data[cload_name] = []
+        if section == '*cload' and line:
+            fields = [field.strip() for field in line.split(',')]
+            if len(fields) < 3:
+                print(f"### WARNING ###: Incomplete *CLOAD entry '{line}'; skipped.")
+                continue
+            name = fields[0]
+            label = direction_label(fields[1])
+            if label is None:
+                print(f"### WARNING ###: Unsupported *CLOAD direction '{fields[1]}' on '{name}'; skipped.")
+                continue
+            try:
+                value = float(fields[2]) if fields[2] else 0.0
+            except ValueError:
+                print(f"### WARNING ###: Invalid *CLOAD value '{fields[2]}' on '{name}'; skipped.")
+                continue
+            if opsection:
+                opsection = False
+                clear_entries(cload_data, name)
+            cload_data.setdefault(name, []).append(
+                (label, value, amplitude_name, step_index, skew_id,
+                 fields[1].strip() in ('4', '5', '6')))
 
-                # Add this entry to the list
-                cload_data[cload_name].append((cload_dir, cload_val, amplitude_name))
+    boundary_blocks = []
 
-    boundary_blocks = []  # Placeholder for output blocks
+    def group_id(name, context):
+        if name.isdigit():
+            return None  # caller creates a dedicated node group
+        nset_data = nsets.get(name)
+        if not nset_data:
+            warn_missing_nset(name, context)
+            return 0
+        return nset_data['id']
 
-    # BCS Block
-    for boundary_name, boundary_dirs in boundary_data.items():
+    def single_node_group(name, context):
+        nonlocal nset_counter
+        nset_counter += 1
+        group = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/GRNOD/NODE/{nset_counter}\n"
+                 f"node group containing only node {name} for {context}\n"
+                 "#   NODEID\n"
+                 f"{name:>10}")
+        return group, nset_counter
+
+    # BCS blocks
+    for boundary_name, boundary_info in boundary_data.items():
+        boundary_dirs = boundary_info['dirs']
         if boundary_name.isdigit():
-            nset_counter += 1
-            ref_nset_counter = nset_counter
-            bcs_grnod = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            bcs_grnod += f"/GRNOD/NODE/{ref_nset_counter}\n"
-            bcs_grnod += f"node group containing only node {boundary_name} for BCS\n"
-            bcs_grnod += "#   NODEID\n"
-            bcs_grnod += f"{boundary_name:>10}"
+            grnod, ref_nset_counter = single_node_group(boundary_name, 'BCS')
         else:
-            nset_data = nsets.get(boundary_name)
-            ref_nset_counter = nset_data['id'] if nset_data else 0
-            bcs_grnod = None
+            ref_nset_counter = group_id(boundary_name, '*BOUNDARY')
+            grnod = None
+        if not ref_nset_counter:
+            continue
+        combined_bcs_dir = ''.join('1' if d in boundary_dirs else '0' for d in ['1', '2', '3'])
+        combined_bcsr_dir = ''.join('1' if d in boundary_dirs else '0' for d in ['4', '5', '6'])
+        block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+        block += f"/BCS/{ref_nset_counter}\n{boundary_name}\n"
+        block += "#  Tra rot   skew_ID  grnod_ID\n"
+        block += f"   {combined_bcs_dir} {combined_bcsr_dir}{boundary_info['skew']:>10}{ref_nset_counter:>10}"
+        boundary_blocks.append(block)
+        if grnod:
+            boundary_blocks.append(grnod)
 
-        combined_bcs_dir = ''.join(['1' if boundary_dir in boundary_dirs else '0' for boundary_dir in ['1', '2', '3']])
-        combined_bcsr_dir = ''.join(['1' if boundary_dir in boundary_dirs else '0' for boundary_dir in ['4', '5', '6']])
-        bcs_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-        bcs_block += f"/BCS/{ref_nset_counter}\n{boundary_name}\n"
-        bcs_block += "#  Tra rot   skew_ID  grnod_ID\n"
-        bcs_block += f"   {combined_bcs_dir} {combined_bcsr_dir}         0{ref_nset_counter:>10}"
-        boundary_blocks.append(bcs_block)
+    # IMPDISP and IMPVEL blocks
+    for kind, entries, keyword in (
+            ('IMPDISP', impd_data, '/IMPDISP'),
+            ('IMPVEL', impv_data, '/IMPVEL')):
+        for name, values in entries.items():
+            group_ref = None
+            for direction, magnitude, amplitude, step, skew in values:
+                start, stop = step_range(steps, step)
+                if group_ref is None:
+                    if name.isdigit():
+                        grnod, group_ref = single_node_group(name, kind)
+                    else:
+                        group_ref = group_id(name, f'*{kind}')
+                        grnod = None
+                    ref_nset_counter = group_ref
+                else:
+                    grnod = None
+                    if name.isdigit():
+                        grnod, group_ref = single_node_group(name, kind)
+                        ref_nset_counter = group_ref
+                    else:
+                        nset_counter += 1
+                        ref_nset_counter = nset_counter
+                if not group_ref:
+                    continue
+                function_id, fct_id = resolve_function_id(
+                    amplitude, functs_dict, f'{keyword} on {name}', fct_id, steps[step]['start']
+                    if 0 <= step < len(steps) else 0.0)
+                block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                block += f"{keyword}/{ref_nset_counter}\n{name}\n"
+                block += f"# References Amplitude: {amplitude}\n"
+                if kind == 'IMPDISP':
+                    # /IMPDISP has no Frame field (unlike /IMPVEL).
+                    block += "#   Ifunct       DIR     Iskew   Isensor   Gnod_id     Icoor\n"
+                    block += f"{function_id:>10}{direction:>10}{skew:>10}         0{group_ref:>10}         0\n"
+                else:
+                    block += "#   Ifunct       DIR     Iskew   Isensor   Gnod_id     Frame     Icoor\n"
+                    block += f"{function_id:>10}{direction:>10}{skew:>10}         0{group_ref:>10}         0         0\n"
+                block += "#            Scale_x             Scale_y              Tstart               Tstop\n"
+                block += f"                   1{magnitude:>20.15g}{start:>20.8g}{stop:>20.8g}"
+                if grnod:
+                    boundary_blocks.append(grnod)
+                boundary_blocks.append(block)
 
-        if bcs_grnod is not None:
-            boundary_blocks.append(bcs_grnod)
-
-    # IMPDISP Block
-    for impd_name, impd_entries in impd_data.items():
-        impd_first_entry = True  # Track if it's the first entry for this impd_name
-
-        if impd_name.isdigit():
-            nset_counter += 1
-            ref_nset_counter = nset_counter
-            grnod_nset_counter = ref_nset_counter
-            impd_grnod = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            impd_grnod += f"/GRNOD/NODE/{ref_nset_counter}\n"
-            impd_grnod += f"node group containing only node {impd_name} for IMPDISP\n"
-            impd_grnod += "#   NODEID\n"
-            impd_grnod += f"{impd_name:>10}"
-
-        else:
-            nset_data = nsets.get(impd_name)
-            ref_nset_counter = nset_data['id'] if nset_data else 0
-            grnod_nset_counter = ref_nset_counter
-            impd_grnod = None
-
-        # Create a separate block for each entry under the same impd_name
-        for impd_dir, impd_val, amplitude_name in impd_entries:
-            # Increment nset_counter for each subsequent entry
-            if not impd_first_entry:
-                nset_counter += 1
-                ref_nset_counter = nset_counter
-                impd_grnod = None
-
-            # Lookup funct_id based on amplitude_name
-            if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
-            else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
-
-            impdisp_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            impdisp_block += f"/IMPDISP/{ref_nset_counter}\n{impd_name}\n"
-            impdisp_block += f"# References Amplitude: {amplitude_name}\n"  # Add amplitude name as a comment
-            impdisp_block += "#   Ifunct       DIR     Iskew   Isensor   Gnod_id               Icoor\n"
-            impdisp_block += f"{funct_id:>10}{impd_dir:>10}         0         0{grnod_nset_counter:>10}                   0\n"
-            impdisp_block += "#            Scale_x             Scale_y              Tstart               Tstop\n"
-            impdisp_block += f"                   1{impd_val:>20.15g}                   0                1E31"
-            boundary_blocks.append(impdisp_block)
-
-            # Append the GRNOD block if it's a digit
-            if impd_grnod is not None:
-                boundary_blocks.append(impd_grnod)
-
-            # Set first_entry to False after handling the first entry
-            impd_first_entry = False
-
-    # IMPVEL Block
-    for impv_name, impv_entries in impv_data.items():
-        impv_first_entry = True  # Track if it's the first entry for this impd_name
-
-        if impv_name.isdigit():
-            nset_counter += 1
-            ref_nset_counter = nset_counter
-            grnod_nset_counter = ref_nset_counter
-            impd_grnod = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            impd_grnod += f"/GRNOD/NODE/{ref_nset_counter}\n"
-            impd_grnod += f"node group containing only node {impd_name} for IMPVEL\n"
-            impd_grnod += "#   NODEID\n"
-            impd_grnod += f"{impv_name:>10}"
-
-        else:
-            nset_data = nsets.get(impv_name)
-            ref_nset_counter = nset_data['id'] if nset_data else 0
-            grnod_nset_counter = ref_nset_counter
-            impv_grnod = None
-
-        # Create a separate block for each entry under the same impd_name
-        for impv_dir, impv_val, amplitude_name in impv_entries:
-            # Increment nset_counter for each subsequent entry
-            if not impv_first_entry:
-                grnod_nset_counter = ref_nset_counter
-                nset_counter += 1
-                ref_nset_counter = nset_counter
-                impv_grnod = None
-
-            # Lookup funct_id based on amplitude_name
-            if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
-            else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
-
-            impvel_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            impvel_block += f"/IMPVEL/{ref_nset_counter}\n{impv_name}\n"
-            impvel_block += f"# References Amplitude: {amplitude_name}\n"  # Add amplitude name as a comment
-            impvel_block += "#   Ifunct       DIR     Iskew   Isensor   Gnod_id     Frame     Icoor\n"
-            impvel_block += f"{funct_id:>10}{impv_dir:>10}         0         0{grnod_nset_counter:>10}         0         0\n"
-            impvel_block += "#            Scale_x             Scale_y              Tstart               Tstop\n"
-            impvel_block += f"                   1{impv_val:>20.15g}                   0                1E31"
-            boundary_blocks.append(impvel_block)
-
-            # Append the GRNOD block if it's a digit
-            if impv_grnod is not None:
-                boundary_blocks.append(impv_grnod)
-
-            # Set first_entry to False after handling the first entry
-            impv_first_entry = False
-
-    # CLOAD Block
+    # CLOAD blocks (XX/YY/ZZ denote moments, which /CLOAD supports natively)
     for cload_name, cload_entries in cload_data.items():
-        cload_first_entry = True  # Track if it's the first entry for this cload_name
-
-        if cload_name.isdigit():
-            for entry in cload_entries:
-                nset_counter += 1
-                ref_nset_counter = nset_counter
-                grnod_nset_counter = ref_nset_counter
-
-                cload_grnod = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                cload_grnod += f"/GRNOD/NODE/{ref_nset_counter}\n"
-                cload_grnod += f"node group containing only node {cload_name} for CLOAD\n"
-                cload_grnod += "#   NODEID\n"
-                cload_grnod += f"{cload_name:>10}"
-
-        else:
-            nset_data = nsets.get(cload_name)
-            ref_nset_counter = nset_data['id'] if nset_data else 0
-            grnod_nset_counter = ref_nset_counter
-            cload_grnod = None
-
-        # Create a separate block for each entry under the same impd_name
-        for cload_dir, cload_val, amplitude_name in cload_entries:
-            # Increment nset_counter for each subsequent entry
-            if not cload_first_entry:
-                grnod_nset_counter = ref_nset_counter
-                nset_counter += 1
-                ref_nset_counter = nset_counter
-                cload_grnod = None
-
-            # Lookup funct_id based on amplitude_name
-            if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
+        group_ref = None
+        for direction, value, amplitude, step, skew, is_moment in cload_entries:
+            if group_ref is None:
+                if cload_name.isdigit():
+                    grnod, group_ref = single_node_group(cload_name, 'CLOAD')
+                else:
+                    group_ref = group_id(cload_name, '*CLOAD')
+                    grnod = None
+                ref_nset_counter = group_ref
             else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
-
-            cload_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            cload_block += f"/CLOAD/{ref_nset_counter}\n{cload_name}\n"
-            cload_block += f"# References Amplitude: {amplitude_name}\n"  # Add amplitude name as a comment
-            cload_block += "#  fct_IDT       DIR   skew ID   sens_ID   Grnd_id                      Ascale_x            Fscale_y\n"
-            cload_block += f"{funct_id:>10}{cload_dir:>10}         0         0{grnod_nset_counter:>10}                             1{cload_val:>20.15g}"
-            boundary_blocks.append(cload_block)
-
-            # Append the GRNOD block if it's a digit
-            if cload_grnod is not None:
-                boundary_blocks.append(cload_grnod)
-
-            # Set first_entry to False after handling the first entry
-            cload_first_entry = False
+                grnod = None
+                if cload_name.isdigit():
+                    grnod, group_ref = single_node_group(cload_name, 'CLOAD')
+                    ref_nset_counter = group_ref
+                else:
+                    nset_counter += 1
+                    ref_nset_counter = nset_counter
+            if not group_ref:
+                continue
+            function_id, fct_id = resolve_function_id(
+                amplitude, functs_dict, f'*CLOAD on {cload_name}', fct_id,
+                steps[step]['start'] if 0 <= step < len(steps) else 0.0)
+            block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+            block += f"/CLOAD/{ref_nset_counter}\n{cload_name}\n"
+            block += f"# References Amplitude: {amplitude}\n"
+            if is_moment:
+                block += "# Moment load: /CLOAD direction XX/YY/ZZ is a moment about X/Y/Z\n"
+            block += "#  fct_IDT       DIR   skew ID   sens_ID   Grnd_id                      Ascale_x            Fscale_y\n"
+            block += f"{function_id:>10}{direction:>10}{skew:>10}         0{group_ref:>10}                             1{value:>20.15g}"
+            if grnod:
+                boundary_blocks.append(grnod)
+            boundary_blocks.append(block)
 
     return boundary_blocks, nset_counter, fct_id
 
@@ -4696,7 +4749,8 @@ def write_functions(functs_dict):
 
         # Start of function block
         function_blocks.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-        function_blocks.append(f"# FUNCTION {funct_id} from *AMPLITUDE {amplitude_name}")
+        definition = funct_data.get('definition', 'TABULAR')
+        function_blocks.append(f"# FUNCTION {funct_id} from *AMPLITUDE {amplitude_name} ({definition})")
         function_blocks.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
         function_blocks.append(f"/FUNCT/{funct_id}")
         function_blocks.append(amplitude_name)
@@ -4712,454 +4766,472 @@ def write_functions(functs_dict):
 
 
 ####################################################################################################
-# Function to convert Velocity Initial Conditions, works for either elset name or single node ID   #
+# Function to convert Initial Conditions (translational and rotational velocity)                    #
 ####################################################################################################
 def convert_initial(input_lines, nset_counter, nsets):
     iniv_data = {}
+    iniv_rot_data = {}
     section = None
 
     for line in input_lines:
-        line = line.strip()
-        if re.search(r'^\s*\*initial\s+conditions\s*,\s*type\s*=\s*velocity\s*$', line, re.IGNORECASE):
-            section = "*inivel"
+        stripped = line.strip()
+        if stripped.lower().startswith('*initial conditions'):
+            type_match = re.search(r'\bTYPE\s*=\s*"?([^",]+?)"?\s*(?:,|$)', stripped, re.IGNORECASE)
+            condition_type = type_match.group(1).strip().upper() if type_match else 'VELOCITY'
+            if condition_type in ('VELOCITY', 'ROTATIONAL VELOCITY', 'ANGULAR VELOCITY'):
+                section = ('ROT' if condition_type != 'VELOCITY' else 'TRA')
+            else:
+                section = None
+                print(f"### WARNING ###: *INITIAL CONDITIONS TYPE={condition_type} is not supported; skipped.")
             continue
-        if line.startswith("*"):
+        if stripped.startswith('*'):
             section = None
-        elif section == "*inivel":
-            fields = line.split(',')
-            iniv_name = fields[0].strip()
-            iniv_dir = int(fields[1].strip())  # Convert to integer
-            iniv_mag_x = 0.0
-            iniv_mag_y = 0.0
-            iniv_mag_z = 0.0
-            # Initialize the dictionary entry for iniv_name if it doesn't exist
-            if iniv_name not in iniv_data:
-                iniv_data[iniv_name] = {}
-
-            if iniv_dir == 1:
-                iniv_mag_x = float(fields[2].strip()) # Convert iniv_mag to a float
-                iniv_data[iniv_name]['iniv_mag_x'] = iniv_mag_x
-            elif 'iniv_mag_x' not in iniv_data[iniv_name]:
-                iniv_data[iniv_name]['iniv_mag_x'] = iniv_mag_x
-            if iniv_dir == 2:
-                iniv_mag_y = float(fields[2].strip()) # Convert iniv_mag to a float
-                iniv_data[iniv_name]['iniv_mag_y'] = iniv_mag_y
-            elif 'iniv_mag_y' not in iniv_data[iniv_name]:
-                iniv_data[iniv_name]['iniv_mag_y'] = iniv_mag_y
-            if iniv_dir == 3:
-                iniv_mag_z = float(fields[2].strip()) # Convert iniv_mag to a float
-                iniv_data[iniv_name]['iniv_mag_z'] = iniv_mag_z
-            elif 'iniv_mag_z' not in iniv_data[iniv_name]:
-                iniv_data[iniv_name]['iniv_mag_z'] = iniv_mag_z
-
-    iniv_groups = {}
-    for iniv_name, iniv_mags in iniv_data.items():
-        if iniv_name.isdigit():
-            # Use tuple of iniv_mags as a unique key to group by
-            mag_key = (
-                iniv_mags.get('iniv_mag_x'),
-                iniv_mags.get('iniv_mag_y'),
-                iniv_mags.get('iniv_mag_z')
-            )
-            if mag_key not in iniv_groups:
-                iniv_groups[mag_key] = []
-            iniv_groups[mag_key].append(iniv_name)
-        else:
-            iniv_groups[(None, None, None)] = iniv_groups.get((None, None, None), []) + [(iniv_name, iniv_mags)]
-
-    initial_blocks = []
-
-    for mag_key, iniv_names in iniv_groups.items():
-        if mag_key == (None, None, None):  # Skip non-digit iniv_names
-            for iniv_name, iniv_mags in iniv_names:
-                nset_data = nsets.get(iniv_name)
-                ref_nset_counter = nset_data['id'] if nset_data else 0
-                iniv_mag_x = iniv_mags.get('iniv_mag_x')
-                iniv_mag_y = iniv_mags.get('iniv_mag_y')
-                iniv_mag_z = iniv_mags.get('iniv_mag_z')
-                if radversion == 2025:
-                    iniv_block = (
-                    "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                    f"/INIVEL/TRA/{ref_nset_counter}\n{iniv_name}\n"
-                    "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
-                    f"{iniv_mag_x:>20.15g}{iniv_mag_y:>20.15g}{iniv_mag_z:>20.15g}{ref_nset_counter:>10}\n"
-                    "#   Tstart   sens_ID\n"
-                    "       0.0         0"
-                    )
-                elif radversion ==2023:
-                    iniv_block = (
-                    "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                    f"/INIVEL/TRA/{ref_nset_counter}\n{iniv_name}\n"
-                    "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
-                    f"{iniv_mag_x:>20.15g}{iniv_mag_y:>20.15g}{iniv_mag_z:>20.15g}{ref_nset_counter:>10}"
-                    )
-                initial_blocks.append(iniv_block)
+            continue
+        if section is None or not stripped:
             continue
 
-        # Digit iniv_names with same iniv_mags values
-        nset_counter += 1
-        ref_nset_counter = nset_counter
-        iniv_grnod = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-        iniv_grnod += f"/GRNOD/NODE/{nset_counter}\n"
-        iniv_grnod += "node group containing multiple nodes with same INIVEL values\n"
-        iniv_grnod += "#   NODEID\n"
+        fields = [field.strip() for field in stripped.split(',')]
+        if len(fields) < 3:
+            print(f"### WARNING ###: Incomplete initial condition entry '{stripped}'; skipped.")
+            continue
+        name = fields[0]
+        try:
+            direction = int(fields[1])
+            magnitude = float(fields[2])
+        except ValueError:
+            print(f"### WARNING ###: Invalid initial condition entry '{stripped}'; skipped.")
+            continue
+        if direction not in (1, 2, 3):
+            print(f"### WARNING ###: Unsupported initial velocity component {direction} on '{name}'; skipped.")
+            continue
+        store = iniv_rot_data if section == 'ROT' else iniv_data
+        values = store.setdefault(name, {'x': 0.0, 'y': 0.0, 'z': 0.0})
+        values[('x', 'y', 'z')[direction - 1]] = magnitude
 
-        # Split iniv_names into chunks of 10 for formatting
-        for i in range(0, len(iniv_names), 10):
-            chunk = iniv_names[i:i+10]
-            iniv_grnod += "".join(f"{node:>10}" for node in chunk) + "\n"
+    def group_id(name, context):
+        nonlocal nset_counter
+        if name.isdigit():
+            nset_counter += 1
+            group = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                     f"/GRNOD/NODE/{nset_counter}\n"
+                     f"node group containing only node {name} for {context}\n"
+                     "#   NODEID\n"
+                     f"{name:>10}")
+            return group, nset_counter
+        nset_data = nsets.get(name)
+        if not nset_data:
+            warn_missing_nset(name, f'*INITIAL CONDITIONS ({context})')
+            return None, 0
+        return None, nset_data['id']
 
-        # Create INIVEL block
-        iniv_mag_x, iniv_mag_y, iniv_mag_z = mag_key
-        if radversion == 2025:
-            iniv_block = (
-            "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            f"/INIVEL/TRA/{ref_nset_counter}\n"
-            "Shared INIVEL for group of nodes\n"
-            "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
-            f"{iniv_mag_x:>20.15g}{iniv_mag_y:>20.15g}{iniv_mag_z:>20.15g}{ref_nset_counter:>10}\n"
-            "#   Tstart   sens_ID\n"
-            "       0.0         0"
-            )
-        elif radversion == 2023:
-            iniv_block = (
-            "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            f"/INIVEL/TRA/{ref_nset_counter}\n"
-            "Shared INIVEL for group of nodes\n"
-            "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
-            f"{iniv_mag_x:>20.15g}{iniv_mag_y:>20.15g}{iniv_mag_z:>20.15g}{ref_nset_counter:>10}"
-            )
+    def emit(store, keyword, label, component_names):
+        nonlocal nset_counter
+        blocks = []
+        digit_groups = {}
+        for name, values in store.items():
+            key = tuple(values[component] for component in component_names)
+            if name.isdigit():
+                digit_groups.setdefault(key, []).append(name)
+                continue
+            grnod, ref = group_id(name, label)
+            if not ref:
+                continue
+            block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                     f"/INIVEL/{keyword}/{ref}\n{name}\n"
+                     "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
+                     + "".join(f"{values[c]:>20.15g}" for c in component_names) + f"{ref:>10}         0\n")
+            if radversion == 2025:
+                block += "#   Tstart   sens_ID\n       0.0         0"
+            blocks.append(block)
 
-        initial_blocks.append(iniv_grnod)
-        initial_blocks.append(iniv_block)
+        for key, nodes in digit_groups.items():
+            nset_counter += 1
+            ref = nset_counter
+            grnod = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                     f"/GRNOD/NODE/{ref}\n"
+                     "node group containing multiple nodes with the same INIVEL values\n"
+                     "#   NODEID\n")
+            for i in range(0, len(nodes), 10):
+                grnod += "".join(f"{node:>10}" for node in nodes[i:i + 10]) + "\n"
+            block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                     f"/INIVEL/{keyword}/{ref}\nShared INIVEL for group of nodes\n"
+                     "#                 Vx                  Vy                  Vz  Grnod_id   Skew_id\n"
+                     + "".join(f"{value:>20.15g}" for value in key) + f"{ref:>10}         0\n")
+            if radversion == 2025:
+                block += "#   Tstart   sens_ID\n       0.0         0"
+            blocks.extend([grnod, block])
+        return blocks
 
+    initial_blocks = emit(iniv_data, 'TRA', 'VELOCITY', ('x', 'y', 'z'))
+    initial_blocks += emit(iniv_rot_data, 'ROT', 'ROTATIONAL VELOCITY', ('x', 'y', 'z'))
     return initial_blocks, nset_counter
 
 
 ####################################################################################################
 # Function to convert *DLOADS (only checking Grav type currently)                                  #
 ####################################################################################################
+####################################################################################################
+# Function to convert *DLOAD gravity, centrifugal and other body loads                              #
+####################################################################################################
 def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict, fct_id):
-    dload_data = {}
-
-    amplitude_name = None
-    already_set = False
+    gravity_entries = []
+    centrifugal_entries = []
     section = None
-    skipgrav = False
-    dload_set_exists = False
+    amplitude_name = None
+    skew_id = 0
+    # First *STEP must map to steps[0] from parse_step_info().
+    step_index = -1
+    unsupported_types = set()
+    steps = parse_step_info(input_lines)
 
-    for line in input_lines:
-        line = line.strip()
-        if line.lower().startswith("*dload"):
-            section = "*dload"
-            amplitude_pattern = r'amplitude\s*=\s*([^ ]+)'
-            amplitude_match = re.search(amplitude_pattern, line, re.IGNORECASE)
-            if amplitude_match:
-                amplitude_name = amplitude_match.group(1).strip()  # Get the value after '=' and strip any spaces
+    amplitude_pattern = r'\bAMPLITUDE\s*=\s*"?([^",\s]+)"?'
+    system_pattern = r'\bSYSTEM\s*=\s*"?([^",\s]+)"?'
+
+    for line_number, line in enumerate(input_lines):
+        stripped = line.strip()
+        if stripped.lower().startswith('*step'):
+            step_index += 1
+        if stripped.lower().startswith('*dload'):
+            section = '*dload'
+            amplitude_match = re.search(amplitude_pattern, stripped, re.IGNORECASE)
+            amplitude_name = amplitude_match.group(1) if amplitude_match else None
+            system_match = re.search(system_pattern, stripped, re.IGNORECASE)
+            skew_id = int(system_match.group(1)) if system_match and system_match.group(1).isdigit() else 0
             continue
-        if line.startswith("*"):
+        if stripped.startswith('*'):
             section = None
-        elif section == "*dload":
-            fields = line.split(',')
-            dload_name = fields[0].strip()
-            dload_type = fields[1].strip()
+            continue
+        if section != '*dload' or not stripped:
+            continue
 
-            if dload_name:
-                elset_values = []
-                if dload_name.isdigit():
-                    skipgrav = True
-                    continue
-                #check if dload name is a single part?
-                if dload_name in property_names:
-                    part_ids = []
-                    property_id = property_names[dload_name]['prop_id'] #this is for ref in title and to get node group (same as part number)
-                    part_id = property_names[dload_name].get('part_id', property_id)  # Use part_id for the gravity group
-                    part_ids.append(part_id)
+        fields = [field.strip() for field in stripped.split(',')]
+        if len(fields) < 2:
+            continue
+        load_name = fields[0]
+        load_type = fields[1].upper().strip('"')
+        if load_type == 'GRAV':
+            if len(fields) < 3:
+                print(f"### WARNING ###: Incomplete GRAV entry '{stripped}'; skipped.")
+                continue
+            try:
+                magnitude = float(fields[2])
+                direction = [float(f) if f else 0.0 for f in fields[3:6]]
+            except ValueError:
+                print(f"### WARNING ###: Invalid GRAV entry '{stripped}'; skipped.")
+                continue
+            direction += [0.0] * (3 - len(direction))
+            if not any(abs(value) > 1e-14 for value in direction):
+                print("### WARNING ###: GRAV load has a zero direction; entry skipped.")
+                continue
+            if load_name.isdigit():
+                print(f"### WARNING ###: Numeric DLOAD target '{load_name}' cannot be mapped to a node/part "
+                      "group; gravity applied to the whole model.")
+            gravity_entries.append({
+                'name': load_name,
+                'magnitude': magnitude,
+                'direction': direction,
+                'amplitude': amplitude_name,
+                'step': step_index,
+                'skew': skew_id,
+            })
+            continue
 
-                elif dload_name in nsets:
-                    already_set = True
-                    ref_nset_counter = nsets[dload_name]['id']
+        if load_type in ('CENT', 'CENTRIF', 'ROTA'):
+            if len(fields) < 5:
+                print(f"### WARNING ###: Incomplete {load_type} entry '{stripped}'; skipped.")
+                continue
+            try:
+                rotational = float(fields[2])
+                point1 = [float(v) for v in fields[3:6]]
+                point2 = [float(v) for v in fields[6:9]]
+            except ValueError:
+                print(f"### WARNING ###: Invalid {load_type} entry '{stripped}'; skipped.")
+                continue
+            if len(point2) < 3:
+                print(f"### WARNING ###: Incomplete rotation axis in {load_type} entry; skipped.")
+                continue
+            axis = [point2[i] - point1[i] for i in range(3)]
+            centrifugal_entries.append({
+                'name': load_name,
+                'omega_squared': rotational,
+                'axis': axis,
+                'amplitude': amplitude_name,
+                'step': step_index,
+                'skew': skew_id,
+            })
+            continue
 
-                else:
-                    inside_elset_section = False
-                    for line in input_lines:
-                        elset_line_pattern = r'^\s*\*ELSET\s*,?\s*ELSET\s*=\s*{}\b'.format(re.escape(dload_name))
+        if load_type not in ('P', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'HP',
+                             'TRSHR', 'TRVEC', 'SP', 'VP'):
+            unsupported_types.add(load_type)
 
-                        elset_line_match = re.search(elset_line_pattern, line, re.IGNORECASE)
-                        if elset_line_match:
-                            dload_set_exists = True
-                            inside_elset_section = True
-                            elset_values = []
-                            part_ids = []
-                            continue
-
-                        if inside_elset_section and line.startswith('*'):
-                            inside_elset_section = False
-                            continue
-
-                        if inside_elset_section and line.strip():  # Skip empty lines
-                            values = line.split(',')
-                            elset_values.extend([value.strip() for value in values if value.strip()])
-                            continue
-
-                    for values in elset_values:
-                        property_id = property_names[values]['prop_id']
-                        part_id = property_names[values].get('part_id', property_id)  # Use part_id for the gravity group
-                        part_ids.append(part_id)
-
-            if not dload_name or dload_set_exists is False:
-                if skipgrav:
-                    continue
-                part_ids = []
-                property_id = 'all'
-                part_ids.append(property_id)
-
-            if dload_type.lower() == "grav":
-                dload_mag = float(fields[2].strip()) # Convert dload_mag to a float
-                dload_dir = [float(x) if x.strip() else 0.0 for x in fields[3:6]]  # Convert dload_dir to a list of floats, treating empty fields as 0.0
-                dload_dirb = [0.0, 1.0, 0.0] # set Z' as global Y for now
-                # Calculate the cross product of dir and dirb
-                cross_product = [
-                    dload_dir[1] * dload_dirb[2] - dload_dir[2] * dload_dirb[1],
-                    dload_dir[2] * dload_dirb[0] - dload_dir[0] * dload_dirb[2],
-                    dload_dir[0] * dload_dirb[1] - dload_dir[1] * dload_dirb[0]
-                ]
-
-                # First Check if the cross product is the zero vector for .inp Value and global Y
-                if cross_product == [0, 0, 0]: # vectors are parallel
-                    dload_dirb = [0.0 ,0.0, 1.0] # change to global Z if original vector was global Y
-
-                # Calculate the radiossvalues of dir and dirb
-                cross_product = [
-                    dload_dir[1] * dload_dirb[2] - dload_dir[2] * dload_dirb[1],
-                    dload_dir[2] * dload_dirb[0] - dload_dir[0] * dload_dirb[2],
-                    dload_dir[0] * dload_dirb[1] - dload_dir[1] * dload_dirb[0]
-                ]
-
-                dload_dir = cross_product # set Y' as cross product of original vector and arbitrary Y or Z
-
-                if dload_name not in dload_data:
-                    dload_data[dload_name] = {"TYPE": dload_type, "MAG": dload_mag, "DIR": dload_dir, "DIR2": dload_dirb}
+    for load_type in sorted(unsupported_types):
+        print(f"### WARNING ###: *DLOAD type {load_type} is not supported and was ignored.")
 
     dload_blocks = []
 
-    if skipgrav:
-        return dload_blocks, nset_counter, fct_id
+    def reserve_id():
+        """Reserve and return a unique ID from the shared counter."""
+        nonlocal nset_counter
+        nset_counter += 1
+        return nset_counter
 
-    for dload_name, data in dload_data.items():
-        dload_type = data["TYPE"]
-        dload_mag = data["MAG"]
-        dload_dir = data["DIR"]
-        dload_dirb = data["DIR2"]
+    def resolve_part_ids(name):
+        """Resolve a section/elset name to the Radioss part IDs it contains."""
+        if name in property_names:
+            data = property_names[name]
+            return [data.get('part_id', data['prop_id'])]
+        # An ELSET can group several sections; reproduce the original lookup.
+        members = []
+        inside = False
+        for row in input_lines:
+            stripped = row.strip()
+            match = re.search(r'^\s*\*ELSET\s*,\s*ELSET\s*=\s*"?' + re.escape(name) + r'"?\b',
+                              stripped, re.IGNORECASE)
+            if match:
+                inside = True
+                continue
+            if inside and stripped.startswith('*'):
+                break
+            if inside and stripped:
+                members.extend(value.strip().strip('"') for value in stripped.split(',') if value.strip())
+        part_ids = []
+        for member in members:
+            data = property_names.get(member)
+            if data:
+                part_ids.append(data.get('part_id', data['prop_id']))
+        return part_ids
 
-        if not already_set:
-            if dload_name:
-                nset_counter += 1
-            ref_nset_counter = nset_counter if dload_name else 0
-            if dload_set_exists is False:
-                ref_nset_counter = 0
-        skewandgravid = nset_counter
-        dgrav_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-        dgrav_block += f"/SKEW/FIX/{skewandgravid}\nSkew for Gravity {dload_name}\n"
-        dgrav_block += "#                 OX                  OY                  OZ\n"
-        dgrav_block += "                 0.0                 0.0                 0.0\n"
-        dgrav_block += "#                 X1                  Y1                  Z1\n"
-        dgrav_block += f"{dload_dirb[0]:20.15g}{dload_dirb[1]:20.15g}{dload_dirb[2]:20.15g}\n"
-        dgrav_block += "#                 X2                  Y2                  Z2\n"
-        dgrav_block += f"{dload_dir[0]:20.15g}{dload_dir[1]:20.15g}{dload_dir[2]:20.15g}\n"
-        dgrav_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-        dgrav_block += "# Gravity From .inp DLOAD\n"
+    def part_group(name, context):
+        """Return (group_id, group_block) for a part/elset name, or (0, None)."""
+        nonlocal nset_counter
+        part_ids = resolve_part_ids(name)
+        if not part_ids:
+            print(f"### WARNING ###: Element set '{name}' in {context} not found; "
+                  "load applied to the whole model.")
+            return 0, None
+        group_id = reserve_id()
+        rows = []
+        for i in range(0, len(part_ids), 10):
+            rows.append(''.join(f"{part_id:>10}" for part_id in part_ids[i:i + 10]))
+        block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/GRNOD/PART/{group_id}\n{name} nodes for {context}\n"
+                 "# PART_IDS\n"
+                 + '\n'.join(rows))
+        return group_id, block
 
-        if amplitude_name and amplitude_name in functs_dict:
-            funct_id = functs_dict[amplitude_name].get('id')  # Get function ID for Amplitude from directory
-        else:
-            fct_id  += 1 # increment fct_id for the gravity constant load curve
-            funct_id = fct_id  # Default funct_id if no amplitude_name or no match found
-        dgrav_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-        dgrav_block += f"/GRAV/{skewandgravid}\nGravity {dload_name}\n"
-        dgrav_block += "#funct_IDT       DIR   skew_ID   Isensor  Grnod_id                      Ascale_X            Fscale_Y\n"
-        dgrav_block += f"{funct_id:>10}         X{skewandgravid:>10}         0{ref_nset_counter:>10}                             0{dload_mag:>20.15g}"
+    # Gravity: each *DLOAD entry now gets its own skew, amplitude and group.
+    for index, entry in enumerate(gravity_entries):
+        direction = entry['direction']
+        magnitude = math.sqrt(sum(value * value for value in direction))
+        unit = [value / magnitude for value in direction]
+        # Pick the global axis least aligned with gravity so the skew is never degenerate.
+        reference = min(([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+                        key=lambda axis: abs(sum(a * b for a, b in zip(unit, axis))))
+        cross = [unit[1] * reference[2] - unit[2] * reference[1],
+                 unit[2] * reference[0] - unit[0] * reference[2],
+                 unit[0] * reference[1] - unit[1] * reference[0]]
+        cross_magnitude = math.sqrt(sum(value * value for value in cross))
+        cross = [value / cross_magnitude for value in cross]
 
-        if not already_set and property_id != 'all':
-            dgrav_block += "\n#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            dgrav_block += f"/GRNOD/PART/{nset_counter}\n"
-            dgrav_block += f"{dload_name} secondary nodes\n"
-            dgrav_block += "# PART_IDS\n"
-            # Sort part IDs numerically for better readability
-            sorted_part_ids = sorted(part_ids, key=lambda x: int(x) if str(x).isdigit() else float('inf'))
-            part_id_rows = []
-            for i in range(0, len(sorted_part_ids), 10):
-                row_values = sorted_part_ids[i:i+10]
-                formatted_row = ''.join(f"{value:>10}" for value in row_values)
-                part_id_rows.append(formatted_row)
+        group_id = 0
+        group_block = None
+        if entry['name'] in nsets:
+            group_id = nsets[entry['name']]['id']
+        elif not entry['name'].isdigit() and entry['name']:
+            group_id, group_block = part_group(entry['name'], f'GRAV on {entry["name"]}')
+        # Reserve the load/skew ID *after* any group ID has been allocated so
+        # every /SKEW/FIX and /GRAV ID is unique across mixed targets.
+        load_id = reserve_id()
 
-            # Join all part_id_rows with a newline between each row
-            dgrav_block += '\n'.join(part_id_rows)
+        block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/SKEW/FIX/{load_id}\nSkew for Gravity {entry['name']}\n"
+                 "#                 OX                  OY                  OZ\n"
+                 "                 0.0                 0.0                 0.0\n"
+                 "#                 X1                  Y1                  Z1\n"
+                 + "".join(f"{value:>20.15g}" for value in reference) + "\n"
+                 "#                 X2                  Y2                  Z2\n"
+                 + "".join(f"{value:>20.15g}" for value in cross) + "\n"
+                 "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 "# Gravity From .inp DLOAD\n"
+                 "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/GRAV/{load_id}\nGravity {entry['name']}\n"
+                 "#funct_IDT       DIR   skew_ID   Isensor  Grnod_id                      Ascale_X            Fscale_Y\n")
+        function_id, fct_id = resolve_function_id(
+            entry['amplitude'], functs_dict, f'GRAV on {entry["name"]}', fct_id,
+            steps[entry['step']]['start'] if 0 <= entry['step'] < len(steps) else 0.0)
+        block += (f"{function_id:>10}         X{load_id:>10}         0{group_id:>10}"
+                  f"                             0{entry['magnitude']:>20.15g}")
+        if group_block:
+            block += "\n" + group_block
+        dload_blocks.append(block)
 
-        if not amplitude_name:
-            dgrav_block += "\n#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            dgrav_block += "# Constant Function for use with Gravity Card, (magnitude is defined on /GRAV card)\n"
-            dgrav_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-            dgrav_block += f"/FUNCT/{funct_id}\n"
-            dgrav_block += "Gravity Constant\n"
-            dgrav_block += "#                  X                   Y\n"
-            dgrav_block += "                   0                   1\n"
-            dgrav_block += "                 1.0                   1"
+    # Centrifugal loads map to Radioss /LOAD/CENTRI.
+    for entry in centrifugal_entries:
+        axis = entry['axis']
+        axis_length = math.sqrt(sum(value * value for value in axis))
+        if axis_length <= 1e-14:
+            print(f"### WARNING ###: Centrifugal load on '{entry['name']}' has a zero axis; skipped.")
+            continue
+        unit = [value / axis_length for value in axis]
+        direction = ('XX', 'YY', 'ZZ')[max(range(3), key=lambda k: abs(unit[k]))]
+        if max(abs(value) for value in unit) < 0.999:
+            print(f"### WARNING ###: Centrifugal axis on '{entry['name']}' is not aligned with a global "
+                  f"axis; using {direction} (frame/origin not preserved).")
+        omega = math.sqrt(max(entry['omega_squared'], 0.0))
 
-        dload_blocks.append(dgrav_block)
+        function_id, fct_id = resolve_function_id(
+            entry['amplitude'], functs_dict, f'CENTRIF on {entry["name"]}', fct_id,
+            steps[entry['step']]['start'] if 0 <= entry['step'] < len(steps) else 0.0)
+        if not entry['amplitude']:
+            function_id, fct_id = resolve_function_id(None, functs_dict, 'CENTRIF', fct_id, 0.0)
+            functs_dict['DEFAULT CONSTANT OVER STEP']['data'] = [(0.0, 1.0), (1.0, 1.0)]
+
+        group_id = 0
+        group_block = None
+        if entry['name'] and not entry['name'].isdigit():
+            group_id, group_block = part_group(entry['name'], f'CENTRIF on {entry["name"]}')
+        load_id = reserve_id()
+        block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/LOAD/CENTRI/{load_id}\nCentrifugal from .inp DLOAD {entry['name']}\n"
+                 "#  fct_IDT     Dir   frame_ID    sens_ID    grnod_ID        Ivar              Ascale_x            Fscale_y\n"
+                 f"{function_id:>10}{direction:>8}         0         0{group_id:>12}         1                   1{omega:>20.15g}")
+        if group_block:
+            block += "\n" + group_block
+        dload_blocks.append(block)
 
     return dload_blocks, nset_counter, fct_id
+
 
 ####################################################################################################
 # Function to convert *DSLOAD pressure loads to Radioss /PLOAD/ cards                              #
 ####################################################################################################
+####################################################################################################
+# Function to convert *DSLOAD and *DLOAD pressure loads to Radioss /PLOAD/ cards                     #
+####################################################################################################
 def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dicts,
                   segment_dictionary, functs_dict, fct_id):
-    """Convert pressure-type *DSLOAD entries to Radioss /PLOAD/ blocks."""
+    """Convert pressure-type *DSLOAD and *DLOAD entries to Radioss /PLOAD/ blocks."""
 
     pload_blocks = []
-    surf_segs = []
-    pload_counter = 0
-    existing_surf_id = 0
-    new_surf_id = 0
+    surface_cache = {}
     section = None
     amplitude_name = None
+    # First *STEP must map to steps[0] from parse_step_info().
+    step_index = -1
+    steps = parse_step_info(input_lines)
 
-    # Pressure load types in *DSLOAD that map to /PLOAD/
-    pressure_load_types = {'P', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'}
+    amplitude_pattern = r'\bAMPLITUDE\s*=\s*"?([^",\s]+)"?'
+    system_pattern = r'\bSYSTEM\s*=\s*"?([^",\s]+)"?'
+    skew_id = 0
 
-    # Map solid/shell face IDs to segment_dictionary keys
+    # Map Abaqus face identifiers to segment_dictionary keys.  Numeric 1/2 are
+    # used for shell faces (spos/sneg); numeric 3..6 map to solid side faces.
     face_side_map = {
-        'P1': 's1', 'P2': 's2', 'P3': 's3',
+        'P': 'spos', 'P1': 's1', 'P2': 's2', 'P3': 's3',
         'P4': 's4', 'P5': 's5', 'P6': 's6',
-        'P': 'spos'    # faces (shell: spos, solid: s1-s6)
+        '1': 'spos', '2': 'sneg', '3': 's3', '4': 's4', '5': 's5', '6': 's6',
+        'SPOS': 'spos', 'SNEG': 'sneg',
+        'S1': 's1', 'S2': 's2', 'S3': 's3', 'S4': 's4', 'S5': 's5', 'S6': 's6',
+        'HP': 'spos', 'TRVEC': 'spos', 'TRSHR': 'spos',
     }
-    
-    #print(f"segment dictionary is {segment_dictionary}") # FOR DEBUG
-    
-    for line in input_lines:
-        line_stripped = line.strip()
+    pressure_types = {'P', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'HP', 'TRVEC', 'TRSHR'}
 
-        if line_stripped.lower().startswith("*dsload"):
-            section = "*dsload_pressure"
-            amplitude_name = None
-            amp_match = re.search(r'amplitude\s*=\s*([^\s,]+)', line_stripped, re.IGNORECASE)
-            if amp_match:
-                amplitude_name = amp_match.group(1).strip()
+    for line_number, line in enumerate(input_lines):
+        stripped = line.strip()
+        if stripped.lower().startswith('*step'):
+            step_index += 1
+        if stripped.lower().startswith(('*dsload', '*dload')):
+            section = stripped.split(',')[0].strip().lower()
+            amplitude_match = re.search(amplitude_pattern, stripped, re.IGNORECASE)
+            amplitude_name = amplitude_match.group(1) if amplitude_match else None
+            system_match = re.search(system_pattern, stripped, re.IGNORECASE)
+            skew_id = int(system_match.group(1)) if system_match and system_match.group(1).isdigit() else 0
             continue
-
-        if line_stripped.startswith("*"):
+        if stripped.startswith('*'):
             section = None
             continue
+        if section not in ('*dsload', '*dload') or not stripped:
+            continue
 
-        # --- *DSLOAD pressure processing ---
-        elif section == "*dsload_pressure" and line_stripped:
-            fields = [f.strip() for f in line_stripped.split(',')]
-            if len(fields) < 3:
+        fields = [field.strip().strip('"') for field in stripped.split(',')]
+        if len(fields) < 3:
+            continue
+        elset_name = fields[0]
+        load_type = fields[1].upper()
+        if load_type not in pressure_types:
+            continue  # gravity / centrifugal handled by convert_dloads
+        try:
+            pressure = float(fields[2])
+        except ValueError:
+            print(f"### WARNING ###: Invalid pressure '{fields[2]}' on '{elset_name}'; skipped.")
+            continue
+        if load_type in ('HP', 'TRVEC', 'TRSHR'):
+            print(f"### WARNING ###: {load_type} load on '{elset_name}' is approximated as a uniform "
+                  "normal pressure (/PLOAD); height/shear variation is not preserved.")
+
+        surface_side = face_side_map.get(load_type, 'spos')
+        cache_key = (elset_name, surface_side)
+        # A named *SURFACE is a valid target even when no element block was
+        # collected, so resolve it before checking elset_dicts.
+        existing_surf_id = surface_cache.get(cache_key, 0)
+        if not existing_surf_id:
+            existing_surf_id = surf_name_to_id.get(elset_name, 0)
+            if existing_surf_id:
+                surface_cache[cache_key] = existing_surf_id
+                print(f"### WARNING ###: Reusing surface {existing_surf_id} for '{elset_name}' "
+                      f"({load_type}); confirm it contains the correct faces.")
+
+        elements = elset_dicts.get(elset_name, [])
+        if not elements and not existing_surf_id:
+            print(f"### WARNING ###: Element set/surface '{elset_name}' in pressure load not found; skipped.")
+            continue
+
+        surf_segs = []
+        if not existing_surf_id:
+            for elem in elements:
+                try:
+                    elem_int = int(elem)
+                except (ValueError, TypeError):
+                    continue
+                if elem_int not in segment_dictionary:
+                    continue
+                nodes = segment_dictionary[elem_int].get(surface_side, [])
+                if nodes:
+                    segment_nodes = ''.join(f"{node:>10}" for node in nodes)
+                    surf_segs.append(f"          {segment_nodes}")
+            if not surf_segs:
+                print(f"### WARNING ###: No surface segments found for {load_type} on "
+                      f"'{elset_name}' (side {surface_side}); skipped.")
                 continue
 
-            elset_name = fields[0]
-            load_type = fields[1].upper()
+            surf_id += 1
+            existing_surf_id = surf_id
+            surface_cache[cache_key] = surf_id
+            surf_name_to_id.setdefault(f"{elset_name}::{load_type}", surf_id)
+            surf_block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                          f"# SURF SEGS for pressure surface {elset_name} type {load_type}\n"
+                          "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                          f"/SURF/SEG/{surf_id}\n{elset_name} type {load_type}\n"
+                          + "\n".join(surf_segs))
+            pload_blocks.append(surf_block)
 
-            if load_type not in pressure_load_types:
-                continue  # GRAV and others are handled by convert_dloads
+        function_id, fct_id = resolve_function_id(
+            amplitude_name, functs_dict, f'pressure load on {elset_name}', fct_id,
+            steps[step_index]['start'] if 0 <= step_index < len(steps) else 0.0)
 
-            try:
-                pressure = float(fields[2])
-            except ValueError:
-                continue
-                
-            try:
-                existing_surf_id = surf_name_to_id.get(elset_name, 0)
-                # input (f"surf name is: {elset_name} with id: {existing_surf_id}") # FOR DEBUG              
-            except (ValueError, TypeError):
-                continue
-
-            surface_side = face_side_map.get(load_type)  # None means all faces
-
-            elements = elset_dicts.get(elset_name, [])
-
-            #print(f"found these: '{elements}'") # FOR DEBUG
-            if not elements and not existing_surf_id:
-                print(f"### WARNING ###: Element set '{elset_name}' in *DSLOAD pressure not found. Skipping.")
-                continue
-
-            if elements and not existing_surf_id:
-                print(f"Building seg surf for pressure from Element set '{elset_name}'")
-                # Build surface segments for the specified face(s)
-                surf_segs = []
-                all_sides = ['s1', 's2', 's3', 's4', 's5', 's6', 'spos', 'sneg']
-                for elem in elements:
-                    try:
-                        elem_int = int(elem)
-                    except (ValueError, TypeError):
-                        continue
-                    try: 
-                        if elem_int not in segment_dictionary:
-                            continue
-                    except (ValueError, TypeError):
-                        continue     
-                    sides_to_try = [surface_side] if surface_side else all_sides
-                    for side in sides_to_try:
-                        nodes = segment_dictionary[elem_int].get(side, [])
-                        if nodes:
-                            segment_nodes = ''.join([f"{node:>10}" for node in nodes])
-                            surf_segs.append(f"          {segment_nodes}")
-                            # input (f"surf segs are : {surf_segs}") # FOR DEBUG
-
-            if not surf_segs and not existing_surf_id:
-                print(f"### WARNING ###: No surface segments for *DSLOAD pressure on '{elset_name}'. Skipping.")
-                continue
-
-            if not existing_surf_id:
-               surf_id += 1
-               new_surf_id = surf_id
-               surf_name_key = elset_name  # Use elset_name as key for surf_name_to_id mapping
-               surf_name_to_id[surf_name_key] = new_surf_id
-
-            if amplitude_name and amplitude_name in functs_dict:
-                funct_id_val = functs_dict[amplitude_name].get('id')
-                need_constant_fct = False
-            else:
-                fct_id += 1
-                funct_id_val = fct_id
-                need_constant_fct = True
-
-            nset_counter += 1
-            pload_counter = nset_counter
-
-            if new_surf_id:
-                pload_block  = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"# SURF SEGS for DSLOAD pressure surface {elset_name} type {load_type}\n"
-                pload_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"/SURF/SEG/{new_surf_id}\n{elset_name} type {load_type}\n"
-                pload_block += "\n".join(surf_segs)
-                pload_block += "\n#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"# PLOAD for {elset_name}\n"
-                pload_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"/PLOAD/{pload_counter}\n"
-                pload_block += f"Pressure Load {elset_name} {load_type}\n"
-                pload_block += "#  surf_ID funct_IDp   sens_ID                idel                      Ascale_x            Fscale_y\n"
-                pload_block += f"{new_surf_id:>10}{funct_id_val:>10}         0                   0                             1{pressure:>20.10g}"
-                new_surf_id = 0  # reset new surf status for next use
-            else:
-                pload_block  = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"# PLOAD for {elset_name}\n"
-                pload_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"/PLOAD/{pload_counter}\n"
-                pload_block += f"Pressure Load {elset_name} {load_type}\n"
-                pload_block += "#  surf_ID funct_IDp   sens_ID                idel                      Ascale_x            Fscale_y\n"
-                pload_block += f"{existing_surf_id:>10}{funct_id_val:>10}         0                   0                             1{pressure:>20.10g}"
-
-            if need_constant_fct:
-                pload_block += f"\n#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
-                pload_block += f"/FUNCT/{funct_id_val}\n"
-                pload_block += f"Pressure Constant {elset_name}\n"
-                pload_block += "#                  X                   Y\n"
-                pload_block += "                   0                   1\n"
-                pload_block += "                 1.0                   1"
-
-            pload_blocks.append(pload_block)
+        if skew_id:
+            print(f"### WARNING ###: SYSTEM {skew_id} cannot be applied to /PLOAD; "
+                  "the pressure acts along the surface normal.")
+        nset_counter += 1
+        block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"# PLOAD for {elset_name}\n"
+                 "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                 f"/PLOAD/{nset_counter}\nPressure Load {elset_name} {load_type}\n"
+                 "#  surf_ID funct_IDp   sens_ID                idel                      Ascale_x            Fscale_y\n"
+                 f"{existing_surf_id:>10}{function_id:>10}         0                   0"
+                 f"                             1{pressure:>20.10g}")
+        pload_blocks.append(block)
 
     return pload_blocks, nset_counter, surf_id, fct_id
 
@@ -6128,11 +6200,11 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     boundary_blocks, nset_counter, fct_id = convert_boundary(input_lines, nset_counter,
         nsets, functs_dict, fct_id
         )
+    # Preserve rectangular *SYSTEM definitions as skews that BC/load cards can use.
+    boundary_blocks = build_system_skews(input_lines) + boundary_blocks
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Boundaries Done:         {elapsed_time:8.3f} seconds")
-
-    function_blocks = write_functions(functs_dict)
 
     initial_blocks, nset_counter = convert_initial(input_lines, nset_counter, nsets)
     if run_timer:
@@ -6152,6 +6224,10 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Pressure Loads Done:     {elapsed_time:8.3f} seconds")
+
+    # Functions are written last so step-shifted amplitude copies created while
+    # processing BCs and loads are included in the starter deck.
+    function_blocks = write_functions(functs_dict)
 
     mpc_ties, mpc_rigids, prop_id, max_elem_id = convert_mpc_ties(input_lines, prop_id,
         max_elem_id

@@ -65,13 +65,13 @@ The convertor aims to support .inp format with a good degree of flexibility, cas
 
 Supported keywords: (not all sub-options necessarily supported):
 
-*AMPLITUDE (only TABULAR, default form)
+*AMPLITUDE (TABULAR, EQUALLY SPACED, SMOOTH STEP, EXPONENTIAL, DECAY and AGGREGATE are sampled into /FUNCT)
 
-*BOUNDARY (default, SPC type and TYPE=DISPLACEMENT, TYPE=VELOCITY)
+*BOUNDARY (default, SPC type and TYPE=DISPLACEMENT, TYPE=VELOCITY, OP=NEW, SYSTEM=<id>)
 
-*BOUNDARY condition mappings ENCASTR, PINNED, XSYMM, YSYMM, ZSYMM
+*BOUNDARY condition mappings ENCASTR/ENCASTRE, PINNED, XSYMM, YSYMM, ZSYMM, XSIDE, YSIDE, ZSIDE, XSPHERE, YSPHERE, ZSPHERE
     
-*CLOAD
+*CLOAD (forces X/Y/Z and moments XX/YY/ZZ on DOF 4/5/6)
 
 *COHESIVE SECTION
 
@@ -93,9 +93,9 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *DISTRIBUTING COUPLING
 
-*DLOAD (only GRAV type)
+*DLOAD (GRAV, face pressures P/P1..P6, CENT/CENTRIF/ROTA; unsupported types are reported)
 
-*DSLOAD, (Pressure Load Types P, P1, P2, P3, P4, P5, P6)
+*DSLOAD, (Pressure Load Types P, P1, P2, P3, P4, P5, P6; HP/TRVEC/TRSHR are approximated as uniform /PLOAD)
 
 *ELEMENT, *TYPE= 
   
@@ -155,7 +155,7 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *INCLUDE (include files supported for input, the output .rad file will be a single merged file)
 
-*INITIAL CONDITIONS (VELOCITY only)
+*INITIAL CONDITIONS (VELOCITY and ROTATIONAL VELOCITY)
 
 *KINEMATIC COUPLING
 
@@ -187,10 +187,15 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *SURFACE INTERACTION, NAME=RADIOSS_GENERAL (special usecase to ease PrePoMax usage, existence of this will result in a global general contact)
 
-*SYSTEM
+*SYSTEM (rectangular coordinate data is preserved as /SKEW/FIX for BCs and loads; header parameters are discarded with a warning)
 
 *TIE (TYPE = NODE TO SURFACE or TYPE = SURFACE TO SURFACE)
 
 *UNIAXIAL TEST DATA
 
 *VISCOELASTIC, TIME = PRONY
+
+## Support notes
+
+See [docs/SUPPORT.md](docs/SUPPORT.md) for details and known limitations of
+boundary conditions, loads, amplitudes and initial conditions.
