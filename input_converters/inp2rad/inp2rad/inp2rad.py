@@ -43,6 +43,61 @@ radversion = 2025 #2023: for compatibility with HM 2025 and Radioss <2024
 
 debug_mode = False # enables writing of commments and intermediate files for debugging
 
+#---1----|--------------------------------------------------------------------------------------------|
+# Shared I/O helpers (P0/P1/P3). Warning-only or path-handling helpers; they do not change
+# how supported model data is converted.
+#---1----|--------------------------------------------------------------------------------------------|
+def warn(message):
+    """Print a consistently formatted inp2rad warning."""
+    print(f"### WARNING ###: {message}")
+
+def debug_write(lines, suffix):
+    """Write a debug dump, falling back to the current directory when no input path is set.
+
+    Previously these dumps used the (often empty) global input_file_path and failed
+    when inp2rad was called as a library or from a test.
+    """
+    # Debug dumps are opt-in; normal conversions must stay silent on disk.
+    if not debug_mode:
+        return
+    directory = os.path.dirname(input_file_path) if input_file_path else os.getcwd()
+    base = input_file_name or (os.path.splitext(os.path.basename(input_file_path))[0]
+                               if input_file_path else "inp2rad")
+    path = os.path.join(directory, base + suffix)
+    with open(path, "w") as debug_file:
+        for line in lines:
+            debug_file.write(line if str(line).endswith("\n") else str(line) + "\n")
+    print(f"Debug dump written to: {path}")
+
+# Original (display) names for quoted .inp set/part names that had to be
+# sanitized for the downstream parsers.  Key: internal name, value: display name.
+display_names = {}
+
+def sanitize_inp_line(line):
+    """Normalize names to the character set all downstream parsers understand.
+
+    The Abaqus readers in this converter use character classes such as
+    ``[\\w\\-+/ ]`` for set names.  Keeping quotes or parentheses in a name
+    made those readers fail (and could leave ``property_name`` unbound).  We
+    therefore strip quotes and replace the unsupported characters internally,
+    but remember the original spelling in ``display_names`` so Radioss titles
+    and comments can use it.
+    """
+    def sanitize_quoted(match):
+        original = match.group(1)
+        internal = original.replace('@', '_').replace('(', '_') \
+                           .replace(')', '_').replace('`', '_')
+        if internal != original:
+            display_names[internal] = original
+        return internal
+
+    line = re.sub(r'"([^"]*)"', sanitize_quoted, line)
+    return line.replace('@', '_').replace('(', '_').replace(')', '_').replace('`', '_')
+
+def display_name(name):
+    """Return the original spelling of a sanitized set/part name."""
+    return display_names.get(str(name), name)
+
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
 # Functions to convert aspects of the .inp Model
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
@@ -50,67 +105,114 @@ debug_mode = False # enables writing of commments and intermediate files for deb
 ####################################################################################################
 # Function to identify nodes defined in systems                                                    #
 ####################################################################################################
+def _parse_float_line(line):
+    """Parse a comma separated coordinate line, returning [] on bad data."""
+    try:
+        return [float(value.strip()) for value in line.split(',') if value.strip()]
+    except ValueError:
+        return []
+
 def convert_transforms(input_lines):
+    """Convert *SYSTEM cards to /TRANSFORM/POSITION blocks.
+
+    P0: bounds checks and a stale transform_id (and the coords[2]/coords[5]
+    typo in the no-Z-line fallback) are fixed.
+    P1: TYPE= and other *SYSTEM parameters are preserved in comments and
+    cylindrical/spherical systems are converted as a best-effort fixed frame.
+    """
     transform_lines = []
     transform_data = []
-    transform_id = 0
 
     i = 0
     while i < len(input_lines):
         line = input_lines[i].strip()
-
-        if line.lower().startswith('*system id='):
-            parts = line.split('=', 1)
-            if len(parts) > 1:
-                transform_id = parts[1].strip()
-
+        if not re.match(r'^\s*\*system\b', line, re.IGNORECASE):
             i += 1
-            coords_line = input_lines[i].strip()
-            if coords_line.startswith("*"):
-                transform_id = 0
+            continue
 
+        id_match = re.search(r'\bID\s*=\s*([\w\-]+)', line, re.IGNORECASE)
+        type_match = re.search(r'\bTYPE\s*=\s*([\w\-]+)', line, re.IGNORECASE)
+        nset_match = re.search(r'\bNSET\s*=\s*("[^"]+"|[\w\-]+)', line, re.IGNORECASE)
+        transform_id = id_match.group(1) if id_match else None
+        system_type = type_match.group(1).upper() if type_match else 'RECTANGULAR'
+
+        if not transform_id:
+            warn(f"*SYSTEM without an ID at input line {i + 1} was ignored")
+            i += 1
+            continue
+
+        i += 1
+        if i >= len(input_lines) or input_lines[i].strip().startswith('*'):
+            warn(f"*SYSTEM {transform_id} has no coordinate data; no /TRANSFORM written")
+            continue
+
+        coords = _parse_float_line(input_lines[i])
+        if len(coords) < 6:
+            warn(f"*SYSTEM {transform_id} needs 6 coordinates (origin + axis point); got {len(coords)}")
+            i += 1
+            continue
+
+        Xa, Ya, Za = coords[0], coords[1], coords[2]
+        Xb, Yb, Zb = coords[3], coords[4], coords[5]  # P0: was coords[2]
+
+        z_coords = []
+        if i + 1 < len(input_lines) and not input_lines[i + 1].strip().startswith('*'):
+            i += 1
+            z_coords = _parse_float_line(input_lines[i])
+            if len(z_coords) < 3:
+                warn(f"*SYSTEM {transform_id} Z-axis line could not be parsed; using default direction")
+                z_coords = []
+
+        if system_type in ('CYLINDRICAL', 'SPHERICAL'):
+            # In Abaqus the first line gives the origin and a point on the
+            # local Z axis; the optional second line gives the X reference.
+            z_vec = [Xb - Xa, Yb - Ya, Zb - Za]
+            if z_coords:
+                x_vec = [z_coords[0] - Xa, z_coords[1] - Ya, z_coords[2] - Za]
             else:
-                try:
-                    coords = [float(coord.strip()) for coord in coords_line.split(',')]
-                except ValueError:
-                    # Skip lines that cannot be converted to floats
-                    i += 1
-                    continue
+                warn(f"*SYSTEM {transform_id} ({system_type}) has no X reference point; using global X")
+                x_vec = [1.0, 0.0, 0.0]
+            # Guard against degenerate axis/reference points before projecting
+            # X onto the plane normal to Z.
+            z_len2 = sum(v * v for v in z_vec)
+            if z_len2 <= 1e-24:
+                warn(f"*SYSTEM {transform_id} ({system_type}) has a zero-length axis; using global Z")
+                z_vec = [0.0, 0.0, 1.0]
+                z_len2 = 1.0
+            dot = sum(x_vec[k] * z_vec[k] for k in range(3)) / z_len2
+            x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
+            if sum(v * v for v in x_vec) <= 1e-24:
+                warn(f"*SYSTEM {transform_id} ({system_type}) X reference is parallel to its axis; using a fallback X direction")
+                x_vec = [1.0, 0.0, 0.0] if abs(z_vec[0]) < 0.9 else [0.0, 1.0, 0.0]
+                dot = sum(x_vec[k] * z_vec[k] for k in range(3)) / z_len2
+                x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
+            Xb, Yb, Zb = (Xa + x_vec[0], Ya + x_vec[1], Za + x_vec[2])
+            Xc, Yc, Zc = (Xa + z_vec[0], Ya + z_vec[1], Za + z_vec[2])
+            warn(f"*SYSTEM {transform_id} ({system_type}) is approximated by a fixed /TRANSFORM/POSITION "
+                 "frame at its reference point")
+        else:
+            if z_coords:
+                Xc, Yc, Zc = z_coords[0], z_coords[1], z_coords[2]
+            else:
+                # No Z-axis line: point C is one unit above the origin in Y.
+                Xc, Yc, Zc = Xa, Ya + 1.0, Za
+            if system_type != 'RECTANGULAR':
+                warn(f"*SYSTEM {transform_id} has unrecognised TYPE={system_type}; treated as RECTANGULAR")
 
-                # Extract the required coordinates
-                Xa, Ya, Za = coords[0], coords[1], coords[2]
-                Xb, Yb, Zb = coords[3], coords[4], coords[5]
+        # Generate the Radioss format output
+        transform_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+        transform_lines.append(f"/TRANSFORM/POSITION/{transform_id}")
+        transform_lines.append(f"System {transform_id}")
+        transform_lines.append(f"# TYPE={system_type}" + (f" NSET={nset_match.group(1)}" if nset_match else ""))
+        transform_lines.append(f"{'':>90}{transform_id:>10}")
+        transform_lines.append(f"          {0.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
+        transform_lines.append(f"          {1.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
+        transform_lines.append(f"          {0.0:>20.8f}{1.0:>20.8f}{0.0:>20.8f}")
+        transform_lines.append(f"          {Xa:>20.8f}{Ya:>20.8f}{Za:>20.8f}")
+        transform_lines.append(f"          {Xb:>20.8f}{Yb:>20.8f}{Zb:>20.8f}")
+        transform_lines.append(f"          {Xc:>20.8f}{Yc:>20.8f}{Zc:>20.8f}")
 
-                # Check if there is a second line for the Z-axis direction
-                if i + 1 < len(input_lines) and not input_lines[i + 1].startswith('*'):
-                    i += 1
-                    z_axis_line = input_lines[i].strip()
-                    try:
-                        z_coords = [float(coord.strip()) for coord in z_axis_line.split(',')]
-                        Xc, Yc, Zc = z_coords[0], z_coords[1], z_coords[2]
-                    except ValueError:
-                        # Default Z-axis direction if not provided
-                        Xc, Yc, Zc = 0.0, 0.0, 0.0
-                else:
-                    # Default Z-axis direction if not provided
-                    Xb, Yb, Zb = coords[3], coords[4], coords[2]
-                    Xc, Yc, Zc = coords[0], coords[1]+1, coords[2]
-
-            if not transform_id == 0:
-                # Generate the Radioss format output
-                transform_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
-                transform_lines.append(f"/TRANSFORM/POSITION/{transform_id}")
-                transform_lines.append(f"System {transform_id}")
-                transform_lines.append(f"{'':>90}{transform_id:>10}")
-                transform_lines.append(f"          {0.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
-                transform_lines.append(f"          {1.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
-                transform_lines.append(f"          {0.0:>20.8f}{1.0:>20.8f}{0.0:>20.8f}")
-                transform_lines.append(f"          {Xa:>20.8f}{Ya:>20.8f}{Za:>20.8f}")
-                transform_lines.append(f"          {Xb:>20.8f}{Yb:>20.8f}{Zb:>20.8f}")
-                transform_lines.append(f"          {Xc:>20.8f}{Yc:>20.8f}{Zc:>20.8f}")
-
-                transform_data.append(transform_id)
-
+        transform_data.append(transform_id)
         i += 1
 
     return transform_lines, transform_data
@@ -126,11 +228,14 @@ def read_nodes(input_lines):
     remaining_lines = []
 
     for line in input_lines:
-        if line.lower().startswith('*system id='):
-            parts = line.split('=', 1)
-            if len(parts) > 1:
-                transform_id = parts[1].strip()
+        if re.match(r'^\s*\*system\b', line, re.IGNORECASE):
+            id_match = re.search(r'\bID\s*=\s*([\w\-]+)', line, re.IGNORECASE)
+            # P0: reset the active system for each *SYSTEM block; a system with
+            # no ID must not inherit the previous block's transform.
+            transform_id = id_match.group(1) if id_match else '0'
             inside_node_section = False
+            remaining_lines.append(line)
+            continue
 
         if (
             line.lower().startswith('*node')
@@ -140,8 +245,11 @@ def read_nodes(input_lines):
             ):
             inside_node_section = True
 
-        elif inside_node_section and line.startswith('*'):
+        elif line.startswith('*'):
+            # P0: leaving the block clears the active system as well as the
+            # node section; otherwise later *NODE blocks reuse a stale ID.
             inside_node_section = False
+            transform_id = '0'
 
         if inside_node_section and not line.startswith('*'):
             if transform_id not in node_data:
@@ -157,14 +265,7 @@ def read_nodes(input_lines):
 ####################################################################################################
 # debug to check the filtered input                                                                #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_filter_postnodes.inp"  # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)   # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in remaining_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("postnodes written")
+    debug_write(remaining_lines, "_test_filter_postnodes.inp")
     return node_data, remaining_lines
 
 
@@ -349,6 +450,11 @@ def convert_nsets(input_lines, nset_references):
             # Initialize NSET entry
             nsets[nset_name] = {'id': None, 'values': [], 'is_referenced': False}
 
+            # P0: a GENERATE card at end of deck used to raise IndexError.
+            if i + 1 >= len(input_lines) or input_lines[i + 1].strip().startswith('*'):
+                warn(f"*NSET GENERATE for '{nset_name}' has no range data; it was ignored")
+                i += 1
+                continue
             # Get the next line with start, end, and (optional) step values for the range
             next_line = input_lines[i + 1].strip()
             if next_line.endswith(','):
@@ -586,13 +692,7 @@ def convert_nsets(input_lines, nset_references):
 ####################################################################################################
 #debug to check the filtered input                                                                 #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_filter_postnsets.inp"  # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)  # FOR DEBUG
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in output_lines: # For debug
-            test_output_file.write(filtered_line)  # Write the filtered deck # for debug
-
-    print("postnsets written")
+    debug_write(output_lines, "_test_filter_postnsets.inp")
     return nsets, nset_counter, output_lines
 
 
@@ -602,12 +702,17 @@ def convert_nsets(input_lines, nset_references):
 def create_nblocks(nsets):
     nset_blocks = []
     for nset_name, nset_data in nsets.items():
+        # Later conversion stages add group-only entries {'id': N} for
+        # GRBRIC/GRSHEL/... groups.  They have no node list and are written by
+        # their own blocks, so skip them here instead of raising KeyError.
+        if 'values' not in nset_data or 'id' not in nset_data:
+            continue
         nset_counter = nset_data['id']
-        nset_values = nset_data['values']
+        nset_values = nset_data.get('values', [])
 
         grnod_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
         grnod_block += f"/GRNOD/NODE/{nset_counter}\n"
-        grnod_block += f"{nset_name}\n"
+        grnod_block += f"{display_name(nset_name)}\n"
         for i in range(0, len(nset_values), 10):
             row_values = nset_values[i:i+10]
             # Right-justified columns
@@ -615,10 +720,10 @@ def create_nblocks(nsets):
             grnod_block += formatted_row + '\n'
 
         thnod_block = ""
-        if nset_data['is_referenced']:
+        if nset_data.get('is_referenced', False):
             thnod_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
             thnod_block += f"/TH/NODE/{nset_counter}\n"
-            thnod_block += f"{nset_name}\n"
+            thnod_block += f"{display_name(nset_name)}\n"
             thnod_block += "#     var1      var2      var3      var4      var5      var6      var7      var8      var9     var10\n"
             thnod_block += "DEF       REACX     REACY     REACZ\n"
             thnod_block += "#    NODid     Iskew                                           NODname\n"
@@ -2368,7 +2473,7 @@ def write_parts(property_names, non_numeric_references, output_file):
             material_id = property_data['material_id']
             output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
             output_file.write(f"/PART/{part_id}\n")
-            output_file.write(part_name + "\n")
+            output_file.write(display_name(part_name) + "\n")
             output_file.write("#     prop       mat    subset\n")
             output_file.write(f"{prop_id:>10}{material_id:>10}         0\n")
 
@@ -2398,8 +2503,8 @@ def write_props(property_names, output_file):
 
         written_prop_ids.add(property_id)
 
-        # Use the determined name for this property ID
-        property_display_name = prop_id_to_name[property_id]
+        # Use the determined name for this property ID (original spelling for quoted names)
+        property_display_name = display_name(prop_id_to_name[property_id])
 
         #print(property_data)
         prop_type = property_data['nint']  # Get the 'type' value from property_data (nint value)
@@ -2844,14 +2949,7 @@ def parse_element_data(input_lines, elset_dicts, property_names, non_numeric_ref
 ####################################################################################################
 # debug to check the filtered input                                                                #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_filter_postelements.inp"#FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)#FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in input_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("postelements written")
+    debug_write(input_lines, "_test_filter_postelements.inp")
     return (
         elset_dicts, element_lines, element_dicts, sh3n_list, shell_list, brick_list,
         property_names, max_elem_id, input_lines, nsets, nset_counter
@@ -5605,6 +5703,64 @@ def convert_discoup(input_lines, nsets, max_elem_id):
 ####################################################################################################
 # Function to Parse control card information for Engine                                            #
 ####################################################################################################
+# Mapping of Radioss animation (/ANIM) cards to the Abaqus field output
+# variables that they reproduce.  Cards marked with '*' are always written.
+ANIM_CARD_VARIABLES = {
+    '/ANIM/VECT/DISP': {'U'},
+    '/ANIM/VECT/VEL': {'V'},
+    '/ANIM/VECT/ACC': {'A'},
+    '/ANIM/VECT/CONT': {'P', 'CONTACT'},
+    '/ANIM/VECT/CONT2': {'P', 'CONTACT'},
+    '/ANIM/VECT/PCONT': {'P', 'CONTACT'},
+    '/ANIM/BRICK/TENS/STRESS': {'S', 'STRESS'},
+    '/ANIM/ELEM/EPSP': {'E', 'PE', 'EPSP'},
+    '/ANIM/ELEM/ENER': {'ENER'},
+    '/ANIM/ELEM/VONM': {'S', 'VONM'},
+    '/ANIM/SHELL/EPSP/UPPER': {'E', 'PE', 'EPSP'},
+    '/ANIM/SHELL/EPSP/LOWER': {'E', 'PE', 'EPSP'},
+    '/ANIM/SHELL/TENS/STRESS/UPPER': {'S', 'STRESS'},
+    '/ANIM/SHELL/TENS/STRESS/LOWER': {'S', 'STRESS'},
+    '/ANIM/NODA/DT': {'*'},
+    '/ANIM/NODA/DMAS': {'*'},
+}
+ANIM_CARD_ORDER = list(ANIM_CARD_VARIABLES)
+KNOWN_FIELD_VARIABLES = set().union(*ANIM_CARD_VARIABLES.values()) - {'*'}
+
+OUTPUT_REQUEST_PATTERNS = {
+    'field': r'^\s*\*OUTPUT\s*,\s*FIELD\b',
+    'history': r'^\s*\*OUTPUT\s*,\s*HISTORY\b',
+    'node': r'^\s*\*NODE\s+(PRINT|FILE)\b',
+    'element': r'^\s*\*ELEMENT\s+(PRINT|FILE)\b',
+    'contact': r'^\s*\*CONTACT\s+(PRINT|FILE)\b',
+}
+
+def collect_output_requests(input_lines):
+    """Collect .inp output requests so the engine deck can reflect them (P1/P3)."""
+    requests = {category: [] for category in OUTPUT_REQUEST_PATTERNS}
+    for index, raw_line in enumerate(input_lines):
+        line = raw_line.strip()
+        category = next(
+            (cat for cat, pattern in OUTPUT_REQUEST_PATTERNS.items()
+             if re.search(pattern, line, re.IGNORECASE)), None
+        )
+        if not category:
+            continue
+        variable_match = re.search(r'\bVARIABLE\s*=\s*([^,\s]+)', line, re.IGNORECASE)
+        variables = [variable_match.group(1)] if variable_match else []
+        preselect = bool(re.search(r'\bPRESELECT\b', line, re.IGNORECASE))
+        j = index + 1
+        while (j < len(input_lines) and input_lines[j].strip()
+               and not input_lines[j].strip().startswith('*')):
+            variables.extend([value.strip() for value in input_lines[j].split(',') if value.strip()])
+            j += 1
+        requests[category].append({
+            'variables': variables,
+            'preselect': preselect,
+            'line': index + 1,
+            'raw': line,
+        })
+    return requests
+
 def parse_control_data(input_lines, simple_file_name):
     engine_file = []
 
@@ -5615,7 +5771,7 @@ def parse_control_data(input_lines, simple_file_name):
     th_interval = 1e-4            #               If available
 
     dt_set = False                #    Tracks whether dt was set by a 'MASS SCALING' input
-
+    output_requests = collect_output_requests(input_lines)
 
     i = 0 # Initialize an index for iterating through input_lines
 
@@ -5653,6 +5809,9 @@ def parse_control_data(input_lines, simple_file_name):
         # Use re.search to find the first match (case-insensitive)
         field_match = re.search(field_pattern, line, re.IGNORECASE)
 
+        # *OUTPUT, HISTORY can set the time-history sampling interval
+        history_match = re.search(OUTPUT_REQUEST_PATTERNS['history'], line, re.IGNORECASE)
+
         if cst_match:
             # Define a regular expression pattern to match 'DT' and its value
             dt_pattern = r'\bDT\s*=\s*([\d.eE+-]+)'
@@ -5675,27 +5834,22 @@ def parse_control_data(input_lines, simple_file_name):
                 dt_value = dt_match.group(1)
                 dt_set = True
 
-        if runtime_match:
-            i += 1
-
-            data_line = input_lines[i].strip()
-            timevalues = data_line.split(',')
-            if not dt_set and timevalues[0].strip():
-                dt_value = float(data_line.split(',')[0])
-            run_time = float(data_line.split(',')[1])
-            anim_interval = run_time / anim_number
-            th_interval = anim_interval / 100
-
-        if direct_runtime_match:
-            i += 1
-
-            data_line = input_lines[i].strip()
-            timevalues = data_line.split(',')
-            if not dt_set and timevalues[0].strip():
-                dt_value = float(data_line.split(',')[0])
-            run_time = float(data_line.split(',')[1])
-            anim_interval = run_time / anim_number
-            th_interval = anim_interval / 100
+        if runtime_match or direct_runtime_match:
+            # P0: the time data line may be absent at end of deck.
+            if i + 1 >= len(input_lines) or input_lines[i + 1].strip().startswith('*'):
+                warn(f"{line} has no time data line; using default run time {run_time}")
+            else:
+                i += 1
+                timevalues = [value.strip() for value in input_lines[i].split(',')]
+                try:
+                    if not dt_set and timevalues[0]:
+                        dt_value = float(timevalues[0])
+                    if len(timevalues) > 1 and timevalues[1]:
+                        run_time = float(timevalues[1])
+                    anim_interval = run_time / anim_number
+                    th_interval = anim_interval / 100
+                except ValueError:
+                    warn(f"Could not parse time data for {line}; using defaults")
 
         if field_match:
             # Define a regular expression pattern to match 'NUMBER INTERVAL =' followed by digits
@@ -5713,13 +5867,27 @@ def parse_control_data(input_lines, simple_file_name):
 
             if interval_match:
                 anim_number = int(interval_match.group(1))
-                anim_interval = run_time / anim_number
-                th_interval = anim_interval / 100
+                if anim_number > 0:
+                    anim_interval = run_time / anim_number
+                    th_interval = anim_interval / 100
+                else:
+                    warn(f"*OUTPUT, FIELD NUMBER INTERVAL must be positive; ignoring {anim_number}")
 
             elif time_interval_match:
-                anim_value = re.search(anim_interval_pattern, line)
-                anim_interval = float(anim_value.group(1))
-                th_interval = anim_interval / 100
+                anim_value = re.search(anim_interval_pattern, line, re.IGNORECASE)
+                if anim_value:
+                    anim_interval = float(anim_value.group(1))
+                    th_interval = anim_interval / 100
+                else:
+                    warn(f"*OUTPUT, FIELD TIME INTERVAL on line {i + 1} could not be parsed")
+
+        if history_match:
+            time_interval_match = re.search(r'TIME INTERVAL\s*=\s*([\d.eE+-]+)', line, re.IGNORECASE)
+            interval_match = re.search(r'NUMBER INTERVAL\s*=\s*(\d+)', line, re.IGNORECASE)
+            if time_interval_match:
+                th_interval = float(time_interval_match.group(1))
+            elif interval_match and int(interval_match.group(1)) > 0:
+                th_interval = run_time / int(interval_match.group(1))
         i += 1
 
     engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
@@ -5729,33 +5897,48 @@ def parse_control_data(input_lines, simple_file_name):
     engine_file.append(f"{run_time}\n")
     engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     engine_file.append("/PARITH/OFF\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    separator = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+    engine_file.append(separator)
+
+    # P1/P3: honour *OUTPUT, FIELD variable selection.  No explicit variable
+    # list (or VARIABLE=PRESELECT) keeps the full default animation set.
+    selected_cards = set(ANIM_CARD_ORDER)
+    field_requests = output_requests['field']
+    if field_requests and all(not request['preselect'] and request['variables']
+                              for request in field_requests):
+        selected_cards = set()
+        requested_variables = set()
+        for request in field_requests:
+            variables = {variable.upper() for variable in request['variables']}
+            requested_variables.update(variables)
+            for name in sorted(variables - KNOWN_FIELD_VARIABLES):
+                warn(f"*OUTPUT, FIELD variable {name} (line {request['line']}) has no /ANIM equivalent and is ignored")
+        for card, variables in ANIM_CARD_VARIABLES.items():
+            # Cards marked '*' (nodal dt/dmass) are always written.
+            if '*' in variables or variables & requested_variables:
+                selected_cards.add(card)
+
+    engine_file.append(separator)
     engine_file.append("/ANIM/DT\n")
     engine_file.append(f"0  {anim_interval}\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/VECT/DISP\n")
-    engine_file.append("/ANIM/VECT/VEL\n")
-    engine_file.append("/ANIM/VECT/ACC\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/VECT/CONT\n")
-    engine_file.append("/ANIM/VECT/CONT2\n")
-    engine_file.append("/ANIM/VECT/PCONT\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/BRICK/TENS/STRESS\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/ELEM/EPSP\n")
-    engine_file.append("/ANIM/ELEM/ENER\n")
-    engine_file.append("/ANIM/ELEM/VONM\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/SHELL/EPSP/UPPER\n")
-    engine_file.append("/ANIM/SHELL/EPSP/LOWER\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/NODA/DT\n")
-    engine_file.append("/ANIM/NODA/DMAS\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    engine_file.append("/ANIM/SHELL/TENS/STRESS/UPPER\n")
-    engine_file.append("/ANIM/SHELL/TENS/STRESS/LOWER\n")
-    engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+
+    anim_groups = [
+        ['/ANIM/VECT/DISP', '/ANIM/VECT/VEL', '/ANIM/VECT/ACC'],
+        ['/ANIM/VECT/CONT', '/ANIM/VECT/CONT2', '/ANIM/VECT/PCONT'],
+        ['/ANIM/BRICK/TENS/STRESS'],
+        ['/ANIM/ELEM/EPSP', '/ANIM/ELEM/ENER', '/ANIM/ELEM/VONM'],
+        ['/ANIM/SHELL/EPSP/UPPER', '/ANIM/SHELL/EPSP/LOWER'],
+        ['/ANIM/NODA/DT', '/ANIM/NODA/DMAS'],
+        ['/ANIM/SHELL/TENS/STRESS/UPPER', '/ANIM/SHELL/TENS/STRESS/LOWER'],
+    ]
+    for group in anim_groups:
+        chosen = [card for card in group if card in selected_cards]
+        if not chosen:
+            continue
+        engine_file.append(separator)
+        engine_file.extend(f"{card}\n" for card in chosen)
+
+    engine_file.append(separator)
     engine_file.append("/DT/NODA/CST/0\n")
     engine_file.append(f"0.9  {dt_value}\n")
     engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
@@ -5766,8 +5949,23 @@ def parse_control_data(input_lines, simple_file_name):
     engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     engine_file.append("/TFILE/4\n")
     engine_file.append(f"{th_interval}\n")
+
+    # P1/P3: history, node/element and contact print/file requests are kept as
+    # comments so they are visible in the engine deck, with explicit warnings.
+    for category in ('history', 'node', 'element', 'contact'):
+        requests = output_requests[category]
+        if not requests:
+            continue
+        for request in requests:
+            variables = ', '.join(request['variables']) if request['variables'] else 'PRESELECT'
+            engine_file.append(f"# inp2rad: line {request['line']}: {request['raw']} (variables: {variables})\n")
+            engine_file.append("#          no equivalent /TH or print/file card is generated; add one manually if needed\n")
+        warn(f"{len(requests)} {category} output request(s) were not converted to Radioss history/print cards "
+             "(see comments in the engine file)")
+
     engine_file.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     engine_file.append("/TH/TITLE\n")
+    engine_file.append(f"Time history for {simple_file_name}\n")  # P0: /TH/TITLE needs a title line
 
     return engine_file
 
@@ -6186,6 +6384,11 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Engine File Done:        {elapsed_time:8.3f} seconds")
+
+    # P0: element/surface processing adds groups to nsets after the original
+    # nset_blocks were built.  Rebuild them from the final nsets so those
+    # groups are not silently dropped from the starter file.
+    nset_blocks = create_nblocks(nsets)
 
     return (
             transform_lines, transform_data, node_lines, nsets, nset_blocks, material_names,
@@ -6724,21 +6927,72 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
 ####################################################################################################
 # Function to Read input file and then run the code on it, starting a progress timer               #
 ####################################################################################################
-def input_read(input_file_path):
+def expand_includes(lines, base_dir, seen=None, depth=0, source="input deck"):
+    """Recursively expand *INCLUDE cards (P0/P1).
+
+    Quoted paths, nested includes and include cycles are handled.  Missing
+    files are replaced by a comment and reported: a literal *INCLUDE line is
+    NOT left in the converted deck where it would be silently ignored.
+    """
+    if seen is None:
+        seen = set()
+    if depth > 20:
+        warn(f"INCLUDE nesting deeper than 20 levels from {source}; further files ignored")
+        return list(lines)
+
+    include_pattern = re.compile(
+        r'^\s*\*INCLUDE\s*,\s*INPUT\s*=\s*("[^"]*"|\'[^\']*\'|[^,\s]+)',
+        re.IGNORECASE,
+    )
+    expanded = []
+    for line in lines:
+        match = include_pattern.match(line)
+        if not match:
+            expanded.append(line)
+            continue
+        raw_path = match.group(1).strip().strip('"\'')
+        include_path = os.path.normpath(os.path.join(base_dir, raw_path))
+        if not os.path.exists(include_path):
+            warn(f"INCLUDE '{raw_path}' from {source} was not found ({include_path}); its contents were NOT converted")
+            expanded.append(f"** inp2rad: missing INCLUDE '{raw_path}' - contents ignored\n")
+            continue
+        real_path = os.path.realpath(include_path)
+        if real_path in seen:
+            warn(f"Recursive INCLUDE '{include_path}' from {source} was skipped to avoid a cycle")
+            continue
+        seen.add(real_path)
+        print(f"Including file: {include_path}")
+        with open(include_path, "r") as include_file:
+            included_lines = include_file.readlines()
+        expanded.extend(expand_includes(included_lines, os.path.dirname(include_path),
+                                        seen, depth + 1, include_path))
+        seen.remove(real_path)
+    return expanded
+
+def input_read(input_deck_path, output_dir=None, output_prefix=None):
+    """Read an .inp deck and return expanded lines plus output paths.
+
+    P1: output_dir/output_prefix allow callers to control where the Radioss
+    starter and engine files are written (default: next to the input deck).
+    """
+    global input_file_path
     global input_file_name
     global run_timer
     global or_gui
     global original_lines
     global start_time
 
-    input_file_name = os.path.basename(input_file_path)
+    input_file_path = input_deck_path
+    input_file_name = os.path.basename(input_deck_path)
     simple_file_name = os.path.splitext(input_file_name)[0]
-    # Use stripped filename with .rad extension
-    output_file_name = os.path.splitext(input_file_name)[0] + "_0000.rad"
-    output_file_path = os.path.join(os.path.dirname(input_file_path), output_file_name)
-    # Use stripped filename with .rad extension
-    engine_file_name = os.path.splitext(input_file_name)[0] + "_0001.rad"
-    engine_file_path = os.path.join(os.path.dirname(input_file_path), engine_file_name)
+    output_base = output_prefix or simple_file_name
+    output_directory = output_dir if output_dir else os.path.dirname(input_deck_path)
+    if output_directory and not os.path.isdir(output_directory):
+        os.makedirs(output_directory, exist_ok=True)
+    output_file_name = output_base + "_0000.rad"
+    output_file_path = os.path.join(output_directory, output_file_name)
+    engine_file_name = output_base + "_0001.rad"
+    engine_file_path = os.path.join(output_directory, engine_file_name)
 
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
     if or_gui:
@@ -6772,23 +7026,9 @@ def input_read(input_file_path):
 # Check for INCLUDE files and process contents                                                     #
 ####################################################################################################
 
-    expanded_lines = []
-    include_pattern = re.compile(r'\*INCLUDE\s*,\s*INPUT\s*=\s*(.+)', re.IGNORECASE)
-
-    for line in original_lines:
-        match = include_pattern.match(line.strip())
-        if match:
-            include_path = match.group(1).strip()
-            include_path = os.path.normpath(os.path.join(os.path.dirname(input_file_path), include_path))  # Resolve relative path
-            if os.path.exists(include_path):
-                print(f"Including file: {include_path}")
-                with open(include_path, "r") as include_file:
-                    expanded_lines.extend(include_file.readlines())
-            else:
-                print(f"### WARNING ###: Included file {include_path} not found. Keeping original reference.")
-                expanded_lines.append(line)
-        else:
-            expanded_lines.append(line)
+    expanded_lines = expand_includes(
+        original_lines, os.path.dirname(os.path.abspath(input_deck_path))
+    )
 
     return (expanded_lines, input_file_name, simple_file_name, output_file_name,
             output_file_path, engine_file_name, engine_file_path)
@@ -6804,27 +7044,25 @@ def preprocess_lines(original_lines):
 
     for line in original_lines:
         if line.lower().startswith('*assembly'):
-            if or_gui:
-                print("### INFO ###")
-                print("part/instance models are not (yet!) supported by the inp2rad script")
-                print("please use a flattened model")
-                print("or you may try standalone conversion by calling this script at commandline")
-                sys.exit("inp2rad unable to continue")
-                break
-
-            print("### INFO ###")
-            print("part/instance models are not (yet!) supported by the inp2rad script")
-            print("if possible use a flattened model")
-            print("process will attempt to continue the best it can")
-            print("")
-            input("press enter to continue")
+            # P0: SystemExit bypassed start()'s `except Exception`, so GUI
+            # callers never received a False status.  Raise a normal error.
+            raise ValueError("inp2rad unable to continue: part/instance (*ASSEMBLY) models are not supported; please use a flattened model")
 
         if not line.startswith('**'):
-            modified_line = line.replace('"', '').replace('@', '_').replace('(', '_').replace(')', '_').replace('`', '_')
+            # P0: preserve quoted names instead of destroying them.
+            modified_line = sanitize_inp_line(line)
 
             if modified_line.lower().startswith('*system'):
                 system_counter += 1
-                modified_line = f'*SYSTEM ID={system_counter}\n'
+                # P1: keep original *SYSTEM parameters (TYPE, NSET, ...); only
+                # the ID is renumbered because inp2rad writes its own frames.
+                if re.search(r'\bID\s*=\s*[\w\-]+', modified_line, re.IGNORECASE):
+                    modified_line = re.sub(r'\bID\s*=\s*[\w\-]+', f'ID={system_counter}',
+                                           modified_line, count=1, flags=re.IGNORECASE)
+                else:
+                    modified_line = modified_line.rstrip() + f', ID={system_counter}\n'
+                if system_counter > 1:
+                    warn("*SYSTEM definitions are renumbered sequentially; check /TRANSFORM IDs")
 
             # Check for lines starting with '*ELEMENT'
             if modified_line.lower().startswith('*element') and not modified_line.lower().startswith('*element output'):
@@ -6866,9 +7104,29 @@ def expand_elset_ranges(input_lines):
             # Remove ", generate" from the line
             line = re.sub(r',\s*generate', '', line, flags=re.IGNORECASE)
             input_lines[i] = line + '\n'
-            # Move to the next line to get the range details
+            # P0: a GENERATE card at the end of the deck (or with a keyword
+            # immediately after it) used to raise IndexError.
+            if i + 1 >= len(input_lines) or input_lines[i + 1].strip().startswith('*'):
+                warn(f"*ELSET GENERATE on line {i + 1} has no range data; it was ignored")
+                i += 1
+                continue
             next_line = input_lines[i + 1].strip()
-            start, end, step = map(int, next_line.split(','))
+            try:
+                range_values = [int(value.strip()) for value in next_line.split(',') if value.strip()]
+            except ValueError:
+                warn(f"*ELSET GENERATE range '{next_line}' on line {i + 2} is not numeric; it was ignored")
+                i += 1
+                continue
+            if len(range_values) < 2:
+                warn(f"*ELSET GENERATE on line {i + 1} needs at least start, end; it was ignored")
+                i += 1
+                continue
+            start, end = range_values[0], range_values[1]
+            step = range_values[2] if len(range_values) > 2 else 1
+            if step == 0:
+                warn(f"*ELSET GENERATE on line {i + 1} has a zero step; it was ignored")
+                i += 1
+                continue
 
             # Generate the range of numbers
             values = list(range(start, end + 1, step))
@@ -6898,14 +7156,7 @@ def expand_elset_ranges(input_lines):
 ####################################################################################################
 # debug to check the expanded input                                                                #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_expanded.inp"  # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)  # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in input_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("expanded written")
+    debug_write(input_lines, "_test_expanded.inp")
     return input_lines
 
 
@@ -6916,7 +7167,6 @@ def create_part_elsets(input_lines):
     placeholder_sets = {}  # Dictionary to store placeholder_elset names, element data, and TYPE
     elset_sets = {}  # Dictionary to store elset names and their element IDs
     referenced_elsets = set()  # Set to store elsets referenced in section cards
-    buffer = []  # Buffer to store new lines for replacement
     placeholder_found = False  # Flag to check if any placeholder is found
 
     # Step 1: Collect all placeholder_elset and their element data
@@ -7078,76 +7328,58 @@ def create_part_elsets(input_lines):
                 # Store the collected element IDs for this elset
                 elset_sets[elset_name] = set(el.strip() for el in element_ids)
             else:
-                # Skip this elset if it wasn't referenced
-                # Move to the next line to avoid re-checking the same elset
+                # Skip this elset if it wasn't referenced.  P0: advance past
+                # the header and its data, but leave i on the following keyword
+                # so it is not skipped (the old extra increment dropped the
+                # next *ELSET/*ELEMENT header).
+                i += 1
                 while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
                     i += 1
-                # Increment i here to skip the elset line as well
-                i += 1
         else:
             i += 1
 
 
-    # Step 4: Find intersections between placeholder_sets and elset_sets
+    # Step 4: Find intersections between placeholder_sets and elset_sets.
+    # P0: generated lines are stored per placeholder block, not in one global
+    # buffer that was flushed (and cleared) at the first keyword.
+    insertions = {}
     for elset_name, elset_ids in elset_sets.items():
         for placeholder_name, placeholder_content in list(placeholder_sets.items()):
             placeholder_data = placeholder_content["data"]
             placeholder_type = placeholder_content["type"]
 
-            # Find the intersection between the placeholder element IDs and the elset IDs
             placeholder_ids = set(placeholder_data.keys())
             intersection_ids = placeholder_ids.intersection(elset_ids)
 
             if intersection_ids:
-                # Write the new *ELEMENT header with the original TYPE and the intersecting elset name
-                new_element_header = f'*ELEMENT,TYPE={placeholder_type},ELSET={elset_name}\n'
-                buffer.append(new_element_header)
+                generated = insertions.setdefault(placeholder_name, [])
+                generated.append(f'*ELEMENT,TYPE={placeholder_type},ELSET={elset_name}\n')
+                # P0: deterministic element order instead of iterating a set.
+                for element_id in sorted(intersection_ids,
+                                         key=lambda value: (0, int(value)) if str(value).isdigit()
+                                         else (1, str(value))):
+                    generated.append(f'{element_id}, {placeholder_data[element_id]}\n')
 
-                # Write the element data for the intersecting IDs
-                for element_id in intersection_ids:
-                    element_data = placeholder_data[element_id]
-                    # Write all nodes on one line after the element ID
-                    buffer.append(f'{element_id}, {element_data}\n')
-
-                # Remove processed IDs from the placeholder set to avoid reprocessing
                 for element_id in intersection_ids:
                     del placeholder_sets[placeholder_name]["data"][element_id]
-
-                # If the placeholder is empty, we can remove it entirely
                 if not placeholder_sets[placeholder_name]["data"]:
                     del placeholder_sets[placeholder_name]
 
 
-    # Step 5: Delete all placeholder blocks and insert buffered lines
+    # Step 5: Delete placeholder blocks and insert their own generated lines.
+    # This also flushes a block that ends at EOF and handles consecutive blocks.
     modified_lines = []
-    inside_placeholder_block = False
-
     i = 0
     while i < len(input_lines):
         line = input_lines[i]
-
-        # Check if we are entering a placeholder block
-        if line.lower().startswith('*element') and 'placeholder_elset_' in line.lower():
-            inside_placeholder_block = True
-            # Skip the current *ELEMENT line (beginning of placeholder block)
-
-        elif inside_placeholder_block:
-            # Continue skipping lines inside the placeholder block
-            if line.startswith('*'):
-                # We've reached the end of the placeholder block, stop skipping
-                inside_placeholder_block = False
-                buffer.append(line)
-
-                # Insert the buffered lines after exiting the block (only once)
-                modified_lines.extend(buffer)
-                buffer = []  # Clear the buffer
-
-            # Skip all lines within the placeholder block
-
-        else:
-            # If not inside a placeholder block, just add the line to the output
-            modified_lines.append(line)
-
+        placeholder_match = re.search(r'placeholder_elset_\d+', line, re.IGNORECASE)
+        if line.lower().startswith('*element') and placeholder_match:
+            i += 1
+            while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+                i += 1
+            modified_lines.extend(insertions.get(placeholder_match.group(0), []))
+            continue
+        modified_lines.append(line)
         i += 1
 
 
@@ -7157,14 +7389,7 @@ def create_part_elsets(input_lines):
 ####################################################################################################
 # debug to check the expanded input                                                                #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_partcreation.inp"  # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)  # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in modified_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("partcreation written")
+    debug_write(modified_lines, "_test_partcreation.inp")
     return [line.rstrip() + '\n' for line in modified_lines]  # Ensure lines end with a newline
 
 
@@ -7175,7 +7400,6 @@ def create_rigid_elsets(input_lines, elset_references):
     placeholder_rigidsets = {} # Dictionary to store placeholder_rigidelset names, element data
     rigid_elset_sets = {}  # Dictionary to store rigid elset names and their element IDs
     referenced_rigid_elsets = set()  # Set to store rigid elsets referenced in rigid cards
-    rigid_buffer = [] # Buffer to store new lines for replacement
     rigid_placeholder_found = False  # Flag to check if any placeholder is found
 
     # Step 1 Rigid: Collect all placeholder_rigidelset and their element data
@@ -7322,74 +7546,52 @@ def create_rigid_elsets(input_lines, elset_references):
                     # Store the collected element IDs for this elset
                     rigid_elset_sets[elset_name] = set(el.strip() for el in element_ids)
             else:
-                # Skip this elset if it wasn't referenced
-                # Move to the next line to avoid re-checking the same elset
+                # P0: advance past the header/data but leave i on the next
+                # keyword so consecutive *ELSET cards are not skipped.
+                i += 1
                 while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
                     i += 1
-                # Increment i here to skip the elset line as well
-                i += 1
         else:
             i += 1
 
 
-    # Step 4 Rigid: Find intersections between placeholder_rigidsets and rigid_elset_sets
+    # Step 4 Rigid: per-block generated lines, deterministic element order.
+    rigid_insertions = {}
     for elset_name, elset_ids in rigid_elset_sets.items():
         for placeholder_name, placeholder_content in list(placeholder_rigidsets.items()):
             placeholder_data = placeholder_content["data"]
             placeholder_type = placeholder_content["type"]
 
-            # Find the intersection between the placeholder element IDs and the elset IDs
             placeholder_ids = set(placeholder_data.keys())
             intersection_ids = placeholder_ids.intersection(elset_ids)
 
             if intersection_ids:
-                # Write the new *ELEMENT header with the original TYPE and the intersecting elset name
-                new_element_header = f'*ELEMENT,TYPE={placeholder_type},ELSET={elset_name}\n'
-                rigid_buffer.append(new_element_header)
+                generated = rigid_insertions.setdefault(placeholder_name, [])
+                generated.append(f'*ELEMENT,TYPE={placeholder_type},ELSET={elset_name}\n')
+                for element_id in sorted(intersection_ids,
+                                         key=lambda value: (0, int(value)) if str(value).isdigit()
+                                         else (1, str(value))):
+                    generated.append(f'{element_id}, {placeholder_data[element_id]}\n')
 
-                # Write the element data for the intersecting IDs
-                for element_id in intersection_ids:
-                    element_data = placeholder_data[element_id]
-                    # Write all nodes on one line after the element ID
-                    rigid_buffer.append(f'{element_id}, {element_data}\n')
-
-                # Remove processed IDs from the placeholder set to avoid reprocessing
                 for element_id in intersection_ids:
                     del placeholder_rigidsets[placeholder_name]["data"][element_id]
-
-                # If the placeholder is empty, we can remove it entirely
                 if not placeholder_rigidsets[placeholder_name]["data"]:
                     del placeholder_rigidsets[placeholder_name]
 
-    # Step 5 Rigid: Delete all rigid_placeholder blocks and insert buffered lines
+    # Step 5 Rigid: replace each placeholder block with its own lines.  This
+    # flushes the last block at EOF and does not swallow the next keyword.
     modified_rigid_lines = []
-    inside_rigid_placeholder_block = False
-
     i = 0
     while i < len(input_lines):
         line = input_lines[i]
-
-        # Check if we are entering a placeholder block
-        if line.lower().startswith('*element') and 'placeholder_rigidelset_' in line.lower():
-            inside_rigid_placeholder_block = True
-            # Skip the current *ELEMENT line (beginning of placeholder block)
-
-        elif inside_rigid_placeholder_block:
-            # Continue skipping lines inside the placeholder block
-            if line.startswith('*'):
-                # We've reached the end of the placeholder block, stop skipping
-                inside_rigid_placeholder_block = False
-                rigid_buffer.append(line)
-
-                modified_rigid_lines.extend(rigid_buffer)
-                rigid_buffer = []  # Clear the buffer
-
-            # Skip all lines within the placeholder block
-
-        else:
-            # If not inside a placeholder block, just add the line to the output
-            modified_rigid_lines.append(line)
-
+        placeholder_match = re.search(r'placeholder_rigidelset_\d+', line, re.IGNORECASE)
+        if line.lower().startswith('*element') and placeholder_match:
+            i += 1
+            while i < len(input_lines) and not input_lines[i].strip().startswith('*'):
+                i += 1
+            modified_rigid_lines.extend(rigid_insertions.get(placeholder_match.group(0), []))
+            continue
+        modified_rigid_lines.append(line)
         i += 1
 
 
@@ -7400,14 +7602,7 @@ def create_rigid_elsets(input_lines, elset_references):
 ####################################################################################################
 # debug to check the rigid expanded input                                                          #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_rigidpartcreation.inp" # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)   # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in modified_rigid_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("rigid partcreation written")
+    debug_write(modified_rigid_lines, "_test_rigidpartcreation.inp")
     return [line.rstrip() + '\n' for line in modified_rigid_lines]  # Ensure lines end with a newline
 
 
@@ -7435,15 +7630,14 @@ def ppm_rigids(input_lines):
             rbody_rotid_match = re.search(rbody_rotid_pattern, line, re.IGNORECASE)
 
             if rbody_rotid_match:
-                rbody_rotid = rbody_rotid_match.group(1).strip()
-                rbody_id = rbody_id_match.group(1).strip()
+                if not rbody_id_match:
+                    warn(f"*RIGID BODY with ROT NODE on line {i + 1} has no REF NODE; substitution skipped")
+                else:
+                    rbody_rotid = rbody_rotid_match.group(1).strip()
+                    rbody_id = rbody_id_match.group(1).strip()
+                    rotref_substitute.append((rbody_rotid, rbody_id))
 
-                rotref_substitute.append((rbody_rotid, rbody_id))
-
-                i += 1
-
-            else:
-                i += 1
+            i += 1
 
         else:
             i += 1
@@ -7452,14 +7646,17 @@ def ppm_rigids(input_lines):
         return input_lines
 
 
-    # Step 2: Parse Boundary and Cload Sections and modify if necessary
+    # Step 2: only rewrite BC/CLOAD lines that actually reference a ROT NODE.
+    # P0: the previous code rewrote every line in these sections (dropping
+    # TYPE=/AMPLITUDE= options and extra columns) and int()'d DOF fields that
+    # can be textual (e.g. ENCASTRE) or empty.
+    rot_map = dict(rotref_substitute)
     section = None
     i = 0
     while i < len(input_lines):
         line = input_lines[i]
 
-        # Check for boundary or cload section
-        if line.lower().startswith("*boundary") :
+        if line.lower().startswith("*boundary"):
             section = "*boundary"
             modified_ppm_lines.append(line)
 
@@ -7472,51 +7669,40 @@ def ppm_rigids(input_lines):
             modified_ppm_lines.append(line)
 
         elif section == "*boundary" and not line.startswith("*"):
-            fields = line.split(',')
-            fields = [f.strip() for f in fields]  # Clean up any extra whitespace
-
-            if len(fields) >= 2:
-                boundary_name = fields[0]  # First field
-                boundary_dir1 = int(fields[1])  # Second field
-                # Set the 3rd field to the 2nd field if it's empty
-                boundary_dir2 = int(fields[2]) if len(fields) >= 3 and fields[2] != '' else boundary_dir1
-                # Generate the list of directions for BCS (range between dir1 and dir2)
-                impd_val = fields[3] if len(fields) >= 4 and fields[3] else "0.0"
-
-                # Check if boundary_name matches any in rotref_substitute and apply substitution
-                for rot_node, ref_node in rotref_substitute:
-                    if boundary_name == rot_node:
-                        boundary_name = ref_node  # Substitute the ref_node for rot_node if matched
-                        boundary_dir1 += 3
-                        boundary_dir2 += 3
-                        break  # Stop after first match
-
-                # Store the modified boundary line in the desired format
-                modified_line = f"{boundary_name}, {boundary_dir1}, {boundary_dir2}, {impd_val}\n"
-                modified_ppm_lines.append(modified_line)
+            fields = [field.strip() for field in line.split(',')]
+            if fields and fields[0] in rot_map:
+                try:
+                    direction1 = int(fields[1])
+                    direction2 = int(fields[2]) if len(fields) > 2 and fields[2] else direction1
+                except (ValueError, IndexError):
+                    warn(f"BOUNDARY line for ROT NODE '{fields[0]}' has non-numeric DOFs; line left unchanged")
+                    modified_ppm_lines.append(line)
+                else:
+                    remainder = fields[3:] if len(fields) > 3 else []
+                    modified_ppm_lines.append(
+                        f"{rot_map[fields[0]]}, {direction1 + 3}, {direction2 + 3}"
+                        + (", " + ", ".join(remainder) if remainder else "") + "\n"
+                    )
+            else:
+                modified_ppm_lines.append(line)
 
         elif section == "*cload" and not line.startswith("*"):
-            fields = line.split(',')
-            fields = [f.strip() for f in fields]  # Clean up any extra whitespace
+            fields = [field.strip() for field in line.split(',')]
+            if fields and fields[0] in rot_map:
+                try:
+                    direction = int(fields[1])
+                except (ValueError, IndexError):
+                    warn(f"CLOAD line for ROT NODE '{fields[0]}' has a non-numeric DOF; line left unchanged")
+                    modified_ppm_lines.append(line)
+                else:
+                    remainder = fields[2:] if len(fields) > 2 else []
+                    modified_ppm_lines.append(
+                        f"{rot_map[fields[0]]}, {direction + 3}"
+                        + (", " + ", ".join(remainder) if remainder else "") + "\n"
+                    )
+            else:
+                modified_ppm_lines.append(line)
 
-            if len(fields) >= 3:
-                cload_name = fields[0]  # First field
-                cload_dir = int(fields[1])  # Second field
-                cload_val = fields[2].strip() if fields[2] != '' else "0.0"  # Set 3rd field to 0.0 if empty
-
-                # Check if cload_name matches any in rotref_substitute and apply substitution
-                for rot_node, ref_node in rotref_substitute:
-                    if cload_name == rot_node:
-                        cload_name = ref_node  # Substitute the ref_node for rot_node if matched
-                        cload_dir += 3
-                        break  # Stop after first match
-
-                # Store the modified boundary line in the desired format
-                modified_line = f"{cload_name}, {cload_dir}, {cload_val}\n"
-                modified_ppm_lines.append(modified_line)
-
-
-        # Store lines that aren't part of a specific section unchanged
         else:
             modified_ppm_lines.append(line)
 
@@ -7529,14 +7715,7 @@ def ppm_rigids(input_lines):
 ####################################################################################################
 # debug to check the rigid expanded input                                                          #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_rotnode_substitutions.inp" # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)  # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:    # for debug
-        for filtered_line in modified_ppm_lines:  # for debug
-            test_output_file.write(filtered_line) # Write the filtered deck # for debug
-
-    print("rotnode subs written")
+    debug_write(modified_ppm_lines, "_test_rotnode_substitutions.inp")
     return [line.rstrip() + '\n' for line in modified_ppm_lines]  # Ensure lines end with a newline
 
 
@@ -7579,23 +7758,25 @@ def find_referenced_elsets(input_lines):
 
         i += 1
 
-    # Step 2: Resolve all references so each elset only contains numbers
-    def resolve_elset(elset_name):
+    # Step 2: Resolve all references so each elset only contains numbers.
+    # P0: detect cycles (A -> B -> A) instead of recursing until RecursionError.
+    def resolve_elset(elset_name, visiting=None):
+        if visiting is None:
+            visiting = set()
+        if elset_name in visiting:
+            warn(f"Circular *ELSET reference '{elset_name}' detected; the cycle was ignored")
+            return []
+        visiting = visiting | {elset_name}
 
         resolved_values = []
         for item in elset_references.get(elset_name, []):
-            # Check if item is already an integer
             if isinstance(item, int):
                 resolved_values.append(item)
-            # If it's a string representation of a number, convert it to an integer
-            elif item.isdigit():
+            elif str(item).isdigit():
                 resolved_values.append(int(item))
-            else:  # Another elset name, resolve it recursively
-                #input(f"this is the item: {item}")
-                if item != elset_name:
-                    resolved_values.extend(resolve_elset(item))  # Recursively resolve
+            elif item != elset_name:
+                resolved_values.extend(resolve_elset(item, visiting))
 
-        # Update the current elset with resolved numeric values only (keeps duplicates for each set)
         elset_references[elset_name] = resolved_values
         return resolved_values
 
@@ -7666,15 +7847,11 @@ def replace_elsets_in_sections(input_lines, elset_references):
 ####################################################################################################
 # debug to check the filtered input                                                                #
 ####################################################################################################
-    output_filter = os.path.splitext(input_file_name)[0] + "_test_filter.inp"  # FOR DEBUG
-    output_filter_path = os.path.join(os.path.dirname(input_file_path), output_filter)  # FOR DEBUG
-
-    with open(output_filter_path, "w") as test_output_file:
-        for parents, elset_names in elsets_for_expansion_dict.items():
-            test_output_file.write(f"{parents}\n")       # Write `parents` with newline
-            test_output_file.write(f"{elset_names}\n")   # Write `elset_names` with newline
-
-    print("filter written")
+    debug_lines = []
+    for parents, elset_names in elsets_for_expansion_dict.items():
+        debug_lines.append(f"{parents}\n")
+        debug_lines.append(f"{elset_names}\n")
+    debug_write(debug_lines, "_test_filter.inp")
     return input_lines, elsets_for_expansion_dict, relsets_for_expansion_dict
 
 
@@ -7684,10 +7861,18 @@ def replace_elsets_in_sections(input_lines, elset_references):
 ####################################################################################################
 # Get input file                                                                                   #
 ####################################################################################################
-def start(input_file_path):
+def start(input_file_path, output_dir=None, output_prefix=None, radv=None):
+    """Convert one .inp deck.  Output location and Radioss version are optional.
+
+    P1: GUI/batch callers can pass output_dir/output_prefix/radv instead of
+    relying on module globals that were never propagated.
+    """
+    global radversion
+    if radv is not None:
+        radversion = radv
     try:
         (original_lines, input_file_name, simple_file_name, output_file_name, output_file_path,
-         engine_file_name, engine_file_path) = input_read(input_file_path)
+         engine_file_name, engine_file_path) = input_read(input_file_path, output_dir, output_prefix)
 
 ####################################################################################################
 # Prepare input file (removes comments, special characters)                                        #
@@ -7751,16 +7936,23 @@ def start(input_file_path):
         return False
 
 
-def execute_gui(input_deck,tm):
-    input_file_path=input_deck
+def execute_gui(input_deck, tm, output_dir=None, output_prefix=None, radv=None):
+    """Entry point used by the OpenCourant GUI.
+
+    P1: tm/or_gui/radversion used to be local variables here and were never
+    visible to start()/input_read(); they are now propagated explicitly.
+    """
+    global run_timer
+    global or_gui
+    global radversion
     run_timer = tm
     or_gui = True    # When run in Batch mode, avoids interaction.
+    if radv is not None:
+        radversion = radv
     try:
-        # Call the start function and capture its return value
-        success = start(input_file_path)
-        return success
-    except Exception as e:
-        # Handle unexpected exceptions
+        return start(input_deck, output_dir=output_dir, output_prefix=output_prefix, radv=radv)
+    except Exception:
+        # start() already logs the error; keep the GUI contract (bool result).
         return False
 
 if __name__ == "__main__":

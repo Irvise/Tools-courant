@@ -194,3 +194,56 @@ Supported keywords: (not all sub-options necessarily supported):
 *UNIAXIAL TEST DATA
 
 *VISCOELASTIC, TIME = PRONY
+
+## Input, preprocessing and output (I/O lane)
+
+The full I/O support matrix, including a list of data that is dropped (with
+the warning that now accompanies it), is in
+[docs/SUPPORT.md](docs/SUPPORT.md).  Summary:
+
+### Input / preprocessing
+
+* `*INCLUDE, INPUT=...` is expanded before conversion, including quoted paths
+  and nested includes.  Include cycles are skipped and missing files are
+  reported; the missing card is replaced by a comment so its contents cannot
+  be silently ignored.
+* Comment lines (`**`) are removed.  Quoted set/part names are normalized
+  internally (quotes removed, unsupported characters replaced with `_`) so all
+  downstream `.inp` parsers agree on a single name; the original spelling is
+  kept as the display name in Radioss part/set titles.
+* `*SYSTEM` cards are renumbered sequentially and become Radioss
+  `/TRANSFORM/POSITION` blocks.  `TYPE=`, `NSET=` and other parameters are
+  kept as comments; cylindrical/spherical systems are approximated by a fixed
+  frame at the reference point and a warning is printed.
+* `*ELSET`/`*NSET` with `GENERATE` are expanded.  A GENERATE card with no
+  numeric range is warned about instead of raising `IndexError`.
+* `*ASSEMBLY` (part/instance) decks are rejected with a catchable error; use a
+  flattened model.
+* Placeholder element blocks created for elements without an ELSET are split
+  per referenced ELSET, in deterministic (numeric) element order, including a
+  block at end-of-file.  Consecutive ELSET cards are no longer skipped.
+* Output files are written next to the input deck by default.  Library and GUI
+  callers can pass `output_dir` / `output_prefix` to `start()`,
+  `input_read()` or `execute_gui()`; `radv` selects 2023/2025 output.  GUI
+  timer/version parameters are now propagated correctly.
+
+### Engine output / post-processing
+
+* A Radioss starter (`*_0000.rad`) and engine file (`*_0001.rad`) are always
+  written.  `/TH/TITLE` now includes a title line.
+* `*DYNAMIC, EXPLICIT` and `*OUTPUT, FIELD` control run time, animation
+  interval and `/TFILE` sampling.  With an explicit field variable list only
+  the corresponding `/ANIM` cards are emitted (e.g. `U` -> `/ANIM/VECT/DISP`);
+  `VARIABLE=PRESELECT` keeps the full default set.
+* `*OUTPUT, HISTORY, TIME INTERVAL=` updates the time-history sampling.
+  History, node/element and contact print/file requests are recorded as
+  comments in the engine deck and produce an explicit warning; no `/TH` or
+  print/file cards are generated for them today.
+
+### Testing status
+
+Automated coverage in this branch is limited to element tests plus the new
+I/O/preprocessing/output tests in [tests/](tests/).  All other conversion
+paths are untested; broader coverage is being added by the P2 lane in a
+separate branch.  Warnings are the primary safety net until that coverage
+lands, so review the conversion log before running a generated deck.
