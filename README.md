@@ -25,7 +25,7 @@ OpenCourant GUI is a graphical launcher for OpenCourant
 
 ## Input converters
 
-* [inp2rad](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad) : converts .inp format to Radioss (.rad) format.
+* [inp2rad](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad) : converts .inp format to Radioss (.rad) format. Its shared `/FUNCT` ID allocator (currently covering material curves, load amplitudes and inline load constants) and the pending-migration integration note are described in the [inp2rad README](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad#shared-function-ids-funct).
 
 ## Output converter
 

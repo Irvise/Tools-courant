@@ -44,6 +44,78 @@ radversion = 2025 #2023: for compatibility with HM 2025 and Radioss <2024
 debug_mode = False # enables writing of commments and intermediate files for debugging
 
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
+# Shared /FUNCT identifier allocation
+#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
+class FunctionIdAllocator:
+    """Allocate unique Radioss ``/FUNCT`` identifiers.
+
+    Every producer of function cards draws its IDs from one shared instance:
+    material curves (plastic, hyperelastic test data, ...), load amplitudes and
+    inline constant functions (gravity, pressure).  ``allocate()`` returns the
+    next free ID and advances the high-water mark, so producers never have to
+    know which IDs another producer has already used.
+
+    ``observe()`` records IDs coming from legacy callers that still pass an
+    explicit ``fct_id``; it never moves the high-water mark backwards.  This is
+    what prevents duplicate /FUNCT cards when material curves and load
+    amplitudes are converted in the same deck.
+    """
+
+    def __init__(self, first_id=0):
+        self.reset(first_id)
+
+    def reset(self, first_id=0):
+        """Restart allocation so the next allocated ID is ``first_id + 1``."""
+        self._last_id = first_id
+
+    def allocate(self):
+        """Return a fresh function ID, unique across all producers."""
+        self._last_id += 1
+        return self._last_id
+
+    def observe(self, fct_id):
+        """Record an externally assigned ID without reusing lower IDs."""
+        if fct_id is not None and fct_id > self._last_id:
+            self._last_id = fct_id
+
+    @property
+    def last_id(self):
+        """Highest function ID allocated (or observed) so far."""
+        return self._last_id
+
+
+# Process-wide allocator shared by every /FUNCT producer.  It is reset at the
+# beginning of each conversion so repeated conversions/tests are independent.
+function_id_allocator = FunctionIdAllocator()
+
+
+def get_function_id_allocator():
+    """Return the process-wide function ID allocator."""
+    return function_id_allocator
+
+
+DEFAULT_AMPLITUDE_NAME = 'DEFAULT CONSTANT OVER STEP'
+
+
+def ensure_default_function(functs_dict, allocator):
+    """Return the shared default function ID, creating it if necessary.
+
+    Load cards with a missing/unknown amplitude reference this function.  It is
+    created with a unique ID from the shared allocator (never the hard-coded
+    ID 1, which may already be a material curve) and is written by
+    ``write_functions()`` like any other amplitude curve.
+    """
+    default_funct_id = functs_dict.get(DEFAULT_AMPLITUDE_NAME, {}).get('id')
+    if default_funct_id is None:
+        default_funct_id = allocator.allocate()
+        functs_dict[DEFAULT_AMPLITUDE_NAME] = {
+            'id': default_funct_id,
+            'data': [(0.0, 1.0), (1.0, 1.0)],
+        }
+    return default_funct_id
+
+
+#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
 # Functions to convert aspects of the .inp Model
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
 
@@ -633,8 +705,8 @@ def create_nblocks(nsets):
 ####################################################################################################
 # Function to convert material data                                                                #
 ####################################################################################################
-def convert_materials(input_lines, nset_counter):
-    fct_id = 0  # Initialize the function ID
+def convert_materials(input_lines, nset_counter, allocator=None):
+    function_id_allocator = allocator or get_function_id_allocator()
     global e_magnitude
     global rho_magnitude
     material_names = {}  # initializes a dictionary of Material name relationships
@@ -955,7 +1027,7 @@ def convert_materials(input_lines, nset_counter):
             # This ensures that the data is in ascending order of abscissa
                 uniaxial_data.sort(key=lambda pair: (pair[0]))
 
-            fct_id += 1  # Increment the fct_id
+            fct_id = function_id_allocator.allocate()  # Unique ID for this curve
             material_names[current_material_name]['uniaxial_data'] = {
                  'fct_id': fct_id,
                  'xy_data': uniaxial_data
@@ -1105,7 +1177,7 @@ def convert_materials(input_lines, nset_counter):
                     
                 i += 1
 
-            fct_id += 1  # Increment the function ID
+            fct_id = function_id_allocator.allocate()  # Unique ID for this curve
 
             # Initialize the material entry for plastic data if it does not exist
             if 'plastic_data' not in material_names[current_material_name]:
@@ -1392,7 +1464,9 @@ def convert_materials(input_lines, nset_counter):
 
         i += 1  # Move to the next line
 
-    return material_names, extra_material_names, fct_id, nset_counter # return material names to main convert def
+    # Return the shared high-water mark so legacy callers can keep threading fct_id
+    return (material_names, extra_material_names, function_id_allocator.last_id,
+            nset_counter) # return material names to main convert def
 
 
 ####################################################################################################
@@ -4123,7 +4197,11 @@ def convert_ties(input_lines, surf_name_to_id, nsets, inter_id):
 ####################################################################################################
 # Function to convert amplitudes to functions                                                      #
 ####################################################################################################
-def read_amplitudes(input_lines, fct_id):
+def read_amplitudes(input_lines, fct_id=None, allocator=None):
+    # fct_id is retained for backward compatibility; the shared allocator is
+    # the single source of truth and stale values cannot roll it back.
+    function_id_allocator = allocator or get_function_id_allocator()
+    function_id_allocator.observe(fct_id)
     functs_dict = {}
     inside_amplitude_section = False
     amplitude_name = None
@@ -4154,7 +4232,7 @@ def read_amplitudes(input_lines, fct_id):
         # Extract the name of the amplitude using regex
         amplitude_name_match = re.search(r"name\s*=\s*([\w\-\.]+)", header, re.IGNORECASE)
         amplitude_name = amplitude_name_match.group(1)
-        fct_id += 1
+        fct_id = function_id_allocator.allocate()  # Unique ID for this amplitude
 
         data = " ".join(block[1:])  # Combine all lines of data
 
@@ -4171,20 +4249,21 @@ def read_amplitudes(input_lines, fct_id):
             }
 
     # Always create a default amplitude at the end for use where one isn't called
-    fct_id += 1  # Increment fct_id for the default amplitude
-    default_amplitude_name = 'DEFAULT CONSTANT OVER STEP'
-    functs_dict[default_amplitude_name] = {
-        'id': fct_id,
-        'data': [(0.0, 1.0), (1.0, 1.0)]  # Default data as (abscissa, ordinate) pairs
-    }
+    ensure_default_function(functs_dict, function_id_allocator)
 
-    return functs_dict, fct_id
+    return functs_dict, function_id_allocator.last_id
 
 
 ####################################################################################################
 # Function to convert BOUNDARY and CLOAD data, BCS, CLOAD and IMPDISPS only for now                #
 ####################################################################################################
-def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
+def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id, allocator=None):
+    # Missing/unknown amplitudes resolve to the shared default function.  If a
+    # legacy/direct caller did not run read_amplitudes(), create it here with a
+    # unique ID: ID 1 may already be a material curve and is never a fallback.
+    function_id_allocator = allocator or get_function_id_allocator()
+    function_id_allocator.observe(fct_id)
+    default_funct_id = ensure_default_function(functs_dict, function_id_allocator)
     boundary_data = {}
     impd_data = {}
     impv_data = {}
@@ -4219,7 +4298,7 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
             if amplitude_match:
                 amplitude_name = amplitude_match.group(1).strip()  # Get the value after '=' and strip any spaces
             else:
-                amplitude_name = 'DEFAULT CONSTANT OVER STEP'
+                amplitude_name = DEFAULT_AMPLITUDE_NAME
             opsection = False
 
             # Check for 'op=new' to clear existing data
@@ -4232,7 +4311,7 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
         if line.lower().startswith("*boundary") and 'amplitude' not in line.lower():
             section = "*boundary"
             imptype = 'DISPLACEMENT'
-            amplitude_name = 'DEFAULT CONSTANT OVER STEP'  # Reset amplitude name for BCS boundaries
+            amplitude_name = DEFAULT_AMPLITUDE_NAME  # Reset amplitude name for BCS boundaries
             opsection = False
 
             # Check for 'op=new' to clear existing data
@@ -4269,7 +4348,7 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
 
         if line.lower().startswith("*cload") and not re.search(r'amplitude\s*=', line.lower()):
             section = "*cload"
-            amplitude_name = 'DEFAULT CONSTANT OVER STEP'  # set cload as constant if no amplitude defined
+            amplitude_name = DEFAULT_AMPLITUDE_NAME  # set cload as constant if no amplitude defined
             opsection = False
 
             # Check for 'op=new' to clear existing data
@@ -4558,9 +4637,9 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
 
             # Lookup funct_id based on amplitude_name
             if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
+                funct_id = functs_dict[amplitude_name].get('id', default_funct_id)
             else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
+                funct_id = default_funct_id
 
             impdisp_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
             impdisp_block += f"/IMPDISP/{ref_nset_counter}\n{impd_name}\n"
@@ -4609,9 +4688,9 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
 
             # Lookup funct_id based on amplitude_name
             if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
+                funct_id = functs_dict[amplitude_name].get('id', default_funct_id)
             else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
+                funct_id = default_funct_id
 
             impvel_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
             impvel_block += f"/IMPVEL/{ref_nset_counter}\n{impv_name}\n"
@@ -4662,9 +4741,9 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
 
             # Lookup funct_id based on amplitude_name
             if amplitude_name and amplitude_name in functs_dict:
-                funct_id = functs_dict[amplitude_name].get('id', 1)  # Default to 1 if no 'id' is found
+                funct_id = functs_dict[amplitude_name].get('id', default_funct_id)
             else:
-                funct_id = 1  # Default funct_id if no amplitude_name or no match found
+                funct_id = default_funct_id
 
             cload_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
             cload_block += f"/CLOAD/{ref_nset_counter}\n{cload_name}\n"
@@ -4680,7 +4759,7 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
             # Set first_entry to False after handling the first entry
             cload_first_entry = False
 
-    return boundary_blocks, nset_counter, fct_id
+    return boundary_blocks, nset_counter, function_id_allocator.last_id
 
 
 ####################################################################################################
@@ -4839,7 +4918,13 @@ def convert_initial(input_lines, nset_counter, nsets):
 ####################################################################################################
 # Function to convert *DLOADS (only checking Grav type currently)                                  #
 ####################################################################################################
-def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict, fct_id):
+def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict, fct_id,
+                   allocator=None):
+    # Inline gravity constants share the global allocator with all other
+    # /FUNCT producers; fct_id is kept only for legacy callers.
+    function_id_allocator = allocator or get_function_id_allocator()
+    function_id_allocator.observe(fct_id)
+    default_funct_id = ensure_default_function(functs_dict, function_id_allocator)
     dload_data = {}
 
     amplitude_name = None
@@ -4944,7 +5029,7 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
     dload_blocks = []
 
     if skipgrav:
-        return dload_blocks, nset_counter, fct_id
+        return dload_blocks, nset_counter, function_id_allocator.last_id
 
     for dload_name, data in dload_data.items():
         dload_type = data["TYPE"]
@@ -4971,10 +5056,13 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
         dgrav_block += "# Gravity From .inp DLOAD\n"
 
         if amplitude_name and amplitude_name in functs_dict:
-            funct_id = functs_dict[amplitude_name].get('id')  # Get function ID for Amplitude from directory
+            funct_id = functs_dict[amplitude_name].get('id', default_funct_id)
+        elif amplitude_name:
+            # Unknown amplitude: reference the shared default function instead
+            # of a not-yet-written constant curve.
+            funct_id = default_funct_id
         else:
-            fct_id  += 1 # increment fct_id for the gravity constant load curve
-            funct_id = fct_id  # Default funct_id if no amplitude_name or no match found
+            funct_id = function_id_allocator.allocate()  # Unique ID for the gravity constant
         dgrav_block += "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
         dgrav_block += f"/GRAV/{skewandgravid}\nGravity {dload_name}\n"
         dgrav_block += "#funct_IDT       DIR   skew_ID   Isensor  Grnod_id                      Ascale_X            Fscale_Y\n"
@@ -5008,14 +5096,23 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
 
         dload_blocks.append(dgrav_block)
 
-    return dload_blocks, nset_counter, fct_id
+    return dload_blocks, nset_counter, function_id_allocator.last_id
 
 ####################################################################################################
 # Function to convert *DSLOAD pressure loads to Radioss /PLOAD/ cards                              #
 ####################################################################################################
 def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dicts,
-                  segment_dictionary, functs_dict, fct_id):
-    """Convert pressure-type *DSLOAD entries to Radioss /PLOAD/ blocks."""
+                  segment_dictionary, functs_dict, fct_id, allocator=None):
+    """Convert pressure-type *DSLOAD entries to Radioss /PLOAD/ blocks.
+
+    Inline pressure constants use the shared /FUNCT allocator, so they cannot
+    collide with material curves or amplitude functions in the same deck.
+    Unknown amplitude names resolve to the shared default amplitude function,
+    matching the behaviour of gravity and boundary loads.
+    """
+    function_id_allocator = allocator or get_function_id_allocator()
+    function_id_allocator.observe(fct_id)
+    default_funct_id = ensure_default_function(functs_dict, function_id_allocator)
 
     pload_blocks = []
     surf_segs = []
@@ -5118,11 +5215,15 @@ def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dic
                surf_name_to_id[surf_name_key] = new_surf_id
 
             if amplitude_name and amplitude_name in functs_dict:
-                funct_id_val = functs_dict[amplitude_name].get('id')
+                funct_id_val = functs_dict[amplitude_name].get('id', default_funct_id)
+                need_constant_fct = False
+            elif amplitude_name:
+                # Same rule as gravity and boundary loads: an unknown amplitude
+                # resolves to the shared default function, not a fresh constant.
+                funct_id_val = default_funct_id
                 need_constant_fct = False
             else:
-                fct_id += 1
-                funct_id_val = fct_id
+                funct_id_val = function_id_allocator.allocate()  # Unique ID for the pressure constant
                 need_constant_fct = True
 
             nset_counter += 1
@@ -5161,7 +5262,7 @@ def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dic
 
             pload_blocks.append(pload_block)
 
-    return pload_blocks, nset_counter, surf_id, fct_id
+    return pload_blocks, nset_counter, surf_id, function_id_allocator.last_id
 
 
 ####################################################################################################
@@ -6020,6 +6121,11 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     non_numeric_references, relsets_for_expansion_dict, nset_references
     ):
 
+    # Every conversion starts from a clean /FUNCT sequence (IDs 1, 2, ...),
+    # including repeated conversions in the same Python process (GUI/tests).
+    function_id_allocator = get_function_id_allocator()
+    function_id_allocator.reset()
+
     transform_lines, transform_data = convert_transforms(input_lines)
     if run_timer:
         elapsed_time = time.time() - start_time
@@ -6050,7 +6156,9 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"Nsets Done:              {elapsed_time:8.3f} seconds")
 
-    material_names, extra_material_names, fct_id, nset_counter = convert_materials(input_lines, nset_counter)
+    material_names, extra_material_names, fct_id, nset_counter = convert_materials(
+        input_lines, nset_counter, function_id_allocator
+        )
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Materials Done:          {elapsed_time:8.3f} seconds")
@@ -6120,13 +6228,13 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"Tied Contacts Done:      {elapsed_time:8.3f} seconds")
 
-    functs_dict, fct_id = read_amplitudes(input_lines, fct_id)
+    functs_dict, fct_id = read_amplitudes(input_lines, fct_id, function_id_allocator)
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Functions Done:          {elapsed_time:8.3f} seconds")
 
     boundary_blocks, nset_counter, fct_id = convert_boundary(input_lines, nset_counter,
-        nsets, functs_dict, fct_id
+        nsets, functs_dict, fct_id, function_id_allocator
         )
     if run_timer:
         elapsed_time = time.time() - start_time
@@ -6140,14 +6248,15 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         print(f"Ini Conditions Done:     {elapsed_time:8.3f} seconds")
 
     dload_blocks, nset_counter, fct_id = convert_dloads(input_lines, nset_counter, nsets,
-        property_names, functs_dict, fct_id
+        property_names, functs_dict, fct_id, function_id_allocator
         )
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Gravity Done:            {elapsed_time:8.3f} seconds")
 
     pload_blocks, nset_counter, surf_id, fct_id = convert_pload(input_lines, nset_counter,
-        surf_id, surf_name_to_id, elset_dicts, segment_dictionary, functs_dict, fct_id
+        surf_id, surf_name_to_id, elset_dicts, segment_dictionary, functs_dict, fct_id,
+        function_id_allocator
         )
     if run_timer:
         elapsed_time = time.time() - start_time
