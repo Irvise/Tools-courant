@@ -25,7 +25,7 @@ OpenCourant GUI is a graphical launcher for OpenCourant
 
 ## Input converters
 
-* [inp2rad](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad) : converts .inp format to Radioss (.rad) format.
+* [inp2rad](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad) : converts .inp format to Radioss (.rad) format. Material conversion details (supported laws, damage-evolution to `/FAIL/TAB1`, `*ORIENTATION` to `/SKEW/FIX`, and temperature-dependence limitations) are documented in [docs/SUPPORT.md](docs/SUPPORT.md).
 
 ## Output converter
 

@@ -117,6 +117,194 @@ def convert_transforms(input_lines):
 
 
 ####################################################################################################
+# Shared Radioss frame/skew ID allocation.                                                          #
+# *SYSTEM-derived /TRANSFORM/POSITION frames, *ORIENTATION /SKEW/FIX cards and the gravity DLOAD     #
+# skew all share one solver namespace, so they must be allocated from a single source.              #
+####################################################################################################
+class SkewIdAllocator:
+    """Allocate unique skew/frame IDs, skipping IDs already used by transforms."""
+
+    def __init__(self, reserved_ids=()):
+        self._used = set()
+        self._next = 1
+        for value in reserved_ids:
+            self.reserve(value)
+
+    def reserve(self, value):
+        """Mark an externally assigned frame ID as unavailable."""
+        try:
+            self._used.add(int(value))
+        except (TypeError, ValueError):
+            pass
+
+    def allocate(self):
+        """Return the next free frame ID (never reused)."""
+        while self._next in self._used:
+            self._next += 1
+        value = self._next
+        self._used.add(value)
+        self._next += 1
+        return value
+
+
+####################################################################################################
+# Abaqus *ORIENTATION -> Radioss /SKEW/FIX support (used by orthotropic LAW93 materials).          #
+####################################################################################################
+def _vec_dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _vec_cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _vec_unit(values):
+    length = sum(v * v for v in values) ** 0.5
+    if length == 0.0:
+        return None
+    return tuple(v / length for v in values)
+
+
+def convert_orientations(input_lines, skew_allocator=None, reserved_ids=None):
+    """Convert Abaqus *ORIENTATION direction-cosine definitions to /SKEW/FIX cards.
+
+    Abaqus defines a local frame with the direction cosines of local axis 1
+    (first data row) and, optionally, local axis 2 (second data row).  Radioss
+    /SKEW/FIX instead stores an origin plus one point on the local Y' axis and
+    one point on the local Z' axis; the local X' axis is Y' x Z'.  With the
+    origin at (0, 0, 0) we therefore write the unit Y' and Z' vectors directly.
+
+    Only the direction-cosine (*ORIENTATION without SYSTEM/POSITION node
+    references) form is supported; anything else is reported as a warning.
+
+    ``skew_allocator`` is the shared SkewIdAllocator used by every skew
+    producer.  For backwards compatibility it may also be an iterable of
+    already-used IDs, in which case a private allocator is created.
+
+    Returns (orientation_lines, orientations) where orientations maps the
+    Abaqus orientation name to {'x', 'y', 'z', 'skew_id'}.
+    """
+    if not isinstance(skew_allocator, SkewIdAllocator):
+        reserved_ids = skew_allocator if reserved_ids is None else reserved_ids
+        skew_allocator = SkewIdAllocator(reserved_ids or ())
+
+    orientations = {}
+    orientation_lines = []
+    i = 0
+    while i < len(input_lines):
+        line = input_lines[i].strip()
+        if not re.match(r'^\s*\*orientation\b', line, re.IGNORECASE):
+            i += 1
+            continue
+
+        name = get_named_parameter(line, 'name')
+        rows, end = read_data_rows(input_lines, i + 1)
+        i = end
+        if not name:
+            warn_ignored_material_data('<unknown>', '*ORIENTATION',
+                                       'missing NAME=; orientation skipped')
+            i += 1
+            continue
+
+        system = get_named_parameter(line, 'system')
+        if system and system.upper() not in ('RECTANGULAR', 'CYLINDRICAL', 'SPHERICAL'):
+            warn_ignored_material_data(name, '*ORIENTATION',
+                                       f"SYSTEM={system} is not supported by inp2rad; "
+                                       "only direction-cosine definitions are converted")
+            i += 1
+            continue
+
+        vectors = []
+        for row in rows[:2]:
+            values = parse_numeric_row(row)
+            if len(values) >= 3 and all(value is not None for value in values[:3]):
+                vectors.append(values[:3])
+        if not vectors:
+            warn_ignored_material_data(name, '*ORIENTATION',
+                                       'no direction-cosine rows found; orientation skipped')
+            i += 1
+            continue
+
+        e1 = _vec_unit(vectors[0])
+        if e1 is None:
+            warn_ignored_material_data(name, '*ORIENTATION',
+                                       'zero-length local 1-axis; orientation skipped')
+            i += 1
+            continue
+
+        if len(vectors) > 1:
+            y_raw = vectors[1]
+        else:
+            # With no explicit local 2-axis, derive one from a global axis that
+            # is not parallel to the local 1-axis (Abaqus Radioss convention).
+            y_raw = (0.0, 0.0, 1.0) if abs(e1[2]) < 0.9 else (0.0, 1.0, 0.0)
+        projection = _vec_dot(y_raw, e1)
+        e2 = _vec_unit(tuple(y_raw[k] - projection * e1[k] for k in range(3)))
+        if e2 is None:
+            helper = (0.0, 1.0, 0.0) if abs(e1[1]) < 0.9 else (1.0, 0.0, 0.0)
+            projection = _vec_dot(helper, e1)
+            e2 = _vec_unit(tuple(helper[k] - projection * e1[k] for k in range(3)))
+        e3 = _vec_cross(e1, e2)
+
+        skew_id = skew_allocator.allocate()
+        orientations[name] = {'x': e1, 'y': e2, 'z': e3, 'skew_id': skew_id}
+
+        orientation_lines.append('#---1----|----2----|----3----|----4----|----5----|----6----|'
+                                 '----7----|----8----|----9----|---10----|\n')
+        orientation_lines.append(f'/SKEW/FIX/{skew_id}\n')
+        orientation_lines.append(f'{name}\n')
+        orientation_lines.append('#                 Ox                  Oy                  Oz\n')
+        orientation_lines.append(f'{0.0:>20.15g}{0.0:>20.15g}{0.0:>20.15g}\n')
+        orientation_lines.append('#                 X1                  Y1                  Z1\n')
+        orientation_lines.append(f'{e2[0]:>20.15g}{e2[1]:>20.15g}{e2[2]:>20.15g}\n')
+        orientation_lines.append('#                 X2                  Y2                  Z2\n')
+        orientation_lines.append(f'{e3[0]:>20.15g}{e3[1]:>20.15g}{e3[2]:>20.15g}\n')
+
+        i += 1
+
+    return orientation_lines, orientations
+
+
+def apply_orientations_to_materials(input_lines, material_names, orientations):
+    """Attach a converted *ORIENTATION to the material used by a section.
+
+    Abaqus assigns an orientation on a section (*SOLID SECTION, ORIENTATION=),
+    not on the material card.  inp2rad properties are keyed by ELSET, but the
+    material name is available on the same section line, so the orientation is
+    stored on the material and later looked up when the property is written.
+    """
+    current_material_name = None
+    i = 0
+    while i < len(input_lines):
+        line = input_lines[i].strip()
+        if re.search(r'^\s*\*material\b', line, re.IGNORECASE):
+            current_material_name = get_named_parameter(line, 'name')
+            i += 1
+            continue
+        if (current_material_name
+                and re.match(r'^\s*\*(solid|shell(\s+general)?|membrane)\s+section\b',
+                             line, re.IGNORECASE)):
+            orientation_name = get_named_parameter(line, 'orientation')
+            if orientation_name:
+                if orientation_name in orientations:
+                    material_names[current_material_name]['orientation_name'] = orientation_name
+                else:
+                    warn_ignored_material_data(
+                        current_material_name, '*ORIENTATION',
+                        f"'{orientation_name}' is not defined in the input; "
+                        "the material keeps the global axes")
+        i += 1
+
+
+def warn_unsupported_temperature(material_name, law_name, detail):
+    """Explicit, solver-facing warning for temperature data a law cannot store."""
+    print(f"### WARNING ###: {law_name} for material '{material_name}' has no "
+          f"temperature-dependent field; {detail} was not converted.")
+
+
+####################################################################################################
 # Function to read nodes sped up by filtering                                                      #
 ####################################################################################################
 def read_nodes(input_lines):
@@ -924,15 +1112,23 @@ def convert_materials(input_lines, nset_counter):
                     zip(keys, values[:9])
                     )
                 e_magnitude = max(e_magnitude, values[0], values[1], values[2])
-                if len(values) > 9 and values[9] is not None:
+                orthotropic_temperature_rows = [
+                    (row_values[9], row_values[:9])
+                    for row_values in (parse_numeric_row(row) for row in elastic_rows)
+                    if len(row_values) > 9 and row_values[9] is not None
+                ]
+                if orthotropic_temperature_rows:
+                    material_names[current_material_name]['orthotropic_temperature_data'] = \
+                        orthotropic_temperature_rows
                     warn_ignored_material_data(
                         current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
                         "temperature dependency found; only the first row is used"
                         )
                 warn_ignored_material_data(
                     current_material_name, '*ELASTIC, ENGINEERING CONSTANTS',
-                    "material directions follow the global axes; define the "
-                    "required material orientation on the Radioss property"
+                    "material directions follow the global axes unless an "
+                    "*ORIENTATION is defined on the referencing section; the "
+                    "required material orientation is written to the Radioss property"
                     )
             elif len(values) >= 4 and values[0] is not None and values[3] is not None:
                 warn_ignored_material_data(
@@ -1131,10 +1327,11 @@ def convert_materials(input_lines, nset_counter):
                 extra_material_names[current_material_name]['jc_damage_data'] = jc_damage_data
             i -= 1
 
-        # damage evolution: keep the (plastic strain, damage) table as a
-        # Radioss function.  Abaqus damage evolution has no one-to-one Radioss
-        # failure card, so the table is written for manual hookup rather than
-        # being silently discarded or turned into a bogus failure law.
+        # Damage evolution: keep the tabulated curve as a /FUNCT and wire it
+        # into a real /FAIL/TAB1 card (see write_fail_tab1).  A second function
+        # ID is reserved for the constant failure-strain table that /FAIL/TAB1
+        # requires.  Both IDs come from the shared function counter so they
+        # cannot collide with plastic/uniaxial/amplitude curves.
         elif current_material_name and damage_evolution_line_match:
             damage_type = get_named_parameter(line, 'type') or 'DUCTILE'
             damage_rows, i = read_data_rows(input_lines, i + 1)
@@ -1145,16 +1342,20 @@ def convert_materials(input_lines, nset_counter):
                     xy_data.append((values[0], values[1]))
             if xy_data:
                 fct_id += 1
+                curve_id = fct_id
+                fct_id += 1
+                table1_id = fct_id
+                # Dcrit is the final damage value of the curve, clamped to the
+                # (0, 1] interval (Radioss fails when accumulated D reaches it).
+                dcrit = max(y for _x, y in xy_data)
+                dcrit = min(1.0, dcrit) if dcrit > 0.0 else 1.0
                 extra_material_names[current_material_name]['damage_evolution_data'] = {
-                    'fct_id': fct_id,
+                    'fct_id': curve_id,
+                    'table1_id': table1_id,
+                    'dcrit': dcrit,
                     'type': damage_type.upper(),
                     'xy_data': xy_data
                 }
-                warn_ignored_material_data(
-                    current_material_name, '*DAMAGE EVOLUTION',
-                    f"TYPE={damage_type.upper()} table written as a /FUNCT only; "
-                    "map it to a Radioss failure model manually"
-                    )
             else:
                 warn_ignored_material_data(
                     current_material_name, '*DAMAGE EVOLUTION',
@@ -1239,14 +1440,22 @@ def convert_materials(input_lines, nset_counter):
 
             plastic_rows, i = read_data_rows(input_lines, i + 1)
             row_values = [parse_numeric_row(row) for row in plastic_rows]
-            if any(len(values) > 2 and values[2] is not None for values in row_values):
+            temperature_rows = [
+                (values[1], values[0], values[2])
+                for values in row_values
+                if len(values) > 2 and values[2] is not None
+            ]
+            if temperature_rows:
                 unsupported.append('temperature/field column in data rows')
+                material_names[current_material_name]['plastic_temperature_data'] = temperature_rows
 
             if unsupported:
                 warn_ignored_material_data(
                     current_material_name, '*PLASTIC',
                     f"{', '.join(unsupported)} is not supported; the stress-strain "
-                    "curve was skipped instead of being converted incorrectly"
+                    "curve was skipped instead of being converted incorrectly. "
+                    "LAW36 (PLAS_TAB) has no temperature-dependent field in the "
+                    "Radioss starter card, so no thermal softening curve is emitted"
                     )
             else:
                 plastic_data = []
@@ -1737,6 +1946,12 @@ def write_elastic_material(
     ):
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     if density_temperature_data or elastic_temperature_data:
+        # Explicit stdout warning (not just a deck comment): /MAT/ELAST (LAW1)
+        # has no temperature-dependent density, E or nu field in Radioss.
+        warn_unsupported_temperature(
+            material_name, '/MAT/ELAST (LAW1)',
+            'temperature-dependent density/elasticity (first row only)'
+            )
         output_file.write("# WARNING: temperature dependent density/elastic data was ignored; "
                           "first row only\n")
         if density_temperature_data:
@@ -1753,10 +1968,24 @@ def write_elastic_material(
 
 # MAT LAW93 (ORTH_HILL)
 # writes a true orthotropic elastic material from *ELASTIC, ENGINEERING CONSTANTS
-def write_orthotropic_material(material_id, material_name, rho, constants, output_file):
+def write_orthotropic_material(material_id, material_name, rho, constants, output_file,
+                               temperature_data=None, skew_id=None):
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
-    output_file.write("# WARNING: material directions follow the .inp global axes; set the "
-                      "orientation on the Radioss property\n")
+    if skew_id:
+        output_file.write(f"# Material directions from the .inp *ORIENTATION mapped to "
+                          f"/SKEW/FIX/{skew_id} on the property\n")
+    else:
+        print(f"### WARNING ###: /MAT/LAW93 (ORTH_HILL) for material '{material_name}' has no "
+              "material orientation; directions follow the .inp global axes. Define an "
+              "*ORIENTATION on the referencing section or set the skew on the Radioss property")
+        output_file.write("# WARNING: material directions follow the .inp global axes; set the "
+                          "orientation on the Radioss property\n")
+    if temperature_data:
+        warn_unsupported_temperature(
+            material_name, '/MAT/LAW93 (ORTH_HILL)',
+            'temperature-dependent engineering constants')
+        output_file.write(f"# WARNING: temperature-dependent engineering constants ignored: "
+                          f"{temperature_data}\n")
     output_file.write(f"/MAT/LAW93/{material_id}\n")
     output_file.write(material_name + "\n")
     output_file.write("#              RHO_I\n")
@@ -1790,9 +2019,18 @@ def write_orthotropic_material(material_id, material_name, rho, constants, outpu
 # MAT LAW36
 # writes plastic material
 def write_plastic_material(
-    material_id, material_name, rho, emodulus, poissrat, plastic_data, output_file
+    material_id, material_name, rho, emodulus, poissrat, plastic_data, output_file,
+    temperature_data=None
     ):
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    if temperature_data:
+        # Verified against the bundled Radioss starter docs (hm_cfg_files and
+        # hm_read_mat36.F): /MAT/PLAS_TAB has no temperature curve field.
+        warn_unsupported_temperature(
+            material_name, '/MAT/PLAS_TAB (LAW36)',
+            f'temperature-dependent plastic data ({len(temperature_data)} row(s))')
+        output_file.write(f"# WARNING: temperature-dependent plastic data ignored: "
+                          f"{temperature_data}\n")
     output_file.write(f"/MAT/PLAS_TAB/{material_id}\n")
     output_file.write(material_name + "\n")
     output_file.write("#              RHO_I\n")
@@ -2185,13 +2423,69 @@ def write_damage_evolution(material_id, damage_data, material_name, output_file)
         return
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     output_file.write(f"# Damage evolution ({damage_data.get('type', 'DUCTILE')}) for material ID {material_id}\n")
-    output_file.write("# WARNING: map this curve to a Radioss failure model manually\n")
+    output_file.write("# Wired automatically to /FAIL/TAB1 (fct_IDd); see the failure card\n")
     output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
     output_file.write(f"/FUNCT/{fct_id}\n")
     output_file.write(f"Damage evolution for {material_name}\n")
     output_file.write("#                  X                   Y\n")
     for x, y in damage_data.get('xy_data', []):
         output_file.write(f"{x:>20.15g}{y:>20.15g}\n")
+
+
+# FAIL/TAB1: tabulated ductile damage evolution from an Abaqus *DAMAGE EVOLUTION
+def write_fail_tab1(material_id, damage_data, material_name, output_file):
+    """Emit a /FAIL/TAB1 card that references the damage-evolution /FUNCT.
+
+    Mapping and documented assumptions (see docs/SUPPORT.md):
+      * fct_IDd is the original Abaqus damage table (kept as its own /FUNCT).
+        The table's abscissa is interpreted as the Radioss accumulated-damage
+        variable and its ordinate as the damage growth rate; this is an
+        approximation, not a one-to-one physical equivalence.
+      * Dcrit is the last (largest) damage ordinate of the table, clamped to
+        (0, 1]; the Radioss default of 1.0 is used when no damage is present.
+      * /FAIL/TAB1 requires a failure-strain table (table1_ID).  A constant
+        table eps_f = 1.0 is generated so the evolution curve, rather than an
+        invented triaxiality law, drives the damage accumulation.
+      * Shell/solid deletion flags use the Radioss defaults (one layer / one
+        integration point); no XFEM or element-size regularisation is used.
+    """
+    fct_id = damage_data.get('fct_id')
+    if not fct_id:
+        return
+    # Always announce the auto-added, approximate failure model on stdout so a
+    # user cannot overlook a physics-changing card in the generated deck.
+    print(f"### WARNING ###: material '{material_name}': *DAMAGE EVOLUTION "
+          f"(TYPE={damage_data.get('type', 'DUCTILE')}) was mapped to an approximate "
+          "/FAIL/TAB1 card; review fct_IDd, Dcrit/Dadv and the constant "
+          "failure-strain table before running")
+    table1_id = damage_data.get('table1_id') or fct_id + 1
+    dcrit = damage_data.get('dcrit', 1.0)
+
+    # Constant failure-strain table required by /FAIL/TAB1: two points are
+    # enough because the curve is constant (triaxiality-independent).
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"# Constant failure strain table for /FAIL/TAB1 of material ID {material_id}\n")
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"/FUNCT/{table1_id}\n")
+    output_file.write(f"Constant failure strain for {material_name}\n")
+    output_file.write("#                  X                   Y\n")
+    output_file.write(f"{0.0:>20.15g}{1.0:>20.15g}\n")
+    output_file.write(f"{1.0:>20.15g}{1.0:>20.15g}\n")
+
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"# /FAIL/TAB1 for material ID {material_id}, from *DAMAGE EVOLUTION\n")
+    output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
+    output_file.write(f"/FAIL/TAB1/{material_id}\n")
+    output_file.write("# IFAIL_SH  IFAIL_SO                             P_THICKFAIL          P_thinfail               Ixfem\n")
+    output_file.write(f"{1:>10}{1:>10}{'':>20}{0.0:>20.15g}{0.0:>20.15g}{'':>10}{0:>10}\n")
+    output_file.write("#              Dcrit                   D                   N                Dadv   fct_IDd\n")
+    output_file.write(f"{dcrit:>20.15g}{0.0:>20.15g}{0.0:>20.15g}{dcrit:>20.15g}{fct_id:>10}\n")
+    output_file.write("#TABLE1_ID             Xscale1             Xscale2 TABLE2_ID             Xscale3             Xscale4\n")
+    output_file.write(f"{table1_id:>10}{1.0:>20.15g}{0.0:>20.15g}{0:>10}{0.0:>20.15g}{0.0:>20.15g}\n")
+    output_file.write("# fct_IDEL           Fscale_EL              EI_REF          INST_START             FAD_EXP    CH_I_F\n")
+    output_file.write(f"{0:>10}{0.0:>20.15g}{0.0:>20.15g}{0.0:>20.15g}{0.0:>20.15g}{0:>10}\n")
+    output_file.write("#  fct_IDT             FscaleT                              Shear_limit             Biax_limit\n")
+    output_file.write(f"{0:>10}{0.0:>20.15g}{'':>30}{0.0:>20.15g}{0.0:>20.15g}\n")
 
 
 # MASSES
@@ -2667,9 +2961,25 @@ def write_parts(property_names, non_numeric_references, output_file):
 ####################################################################################################
 # Def to write properties                                                                          #
 ####################################################################################################
-def write_props(property_names, output_file):
+def write_props(property_names, output_file, material_skew=None, orientations=None):
     written_prop_ids = set()  # Track which property IDs have been written
     prop_id_to_name = {}  # Track which name to use for each property ID
+
+    skew_orientation = {}
+    for name, orientation in (orientations or {}).items():
+        skew_orientation[orientation['skew_id']] = orientation
+
+    def write_orientation_card(property_data):
+        """Write the Vx/Vy/Vz/Iskew card for a property using LAW93."""
+        skew_id = (material_skew or {}).get(property_data.get('material_id'))
+        if not skew_id or skew_id not in skew_orientation:
+            return
+        direction = skew_orientation[skew_id]['x']
+        output_file.write("#                 Vx                  Vy                  Vz     Iskew                            Ip\n")
+        output_file.write(
+            f"{direction[0]:>20.15g}{direction[1]:>20.15g}{direction[2]:>20.15g}"
+            f"{skew_id:>10}{'':>20}{0:>10}\n"
+            )
 
     # First pass: determine the best name for each property ID
     for property_name, property_data in property_names.items():
@@ -2710,6 +3020,7 @@ def write_props(property_names, output_file):
             if radversion == 2025:
                 output_file.write("#        N                         Thick              Ashear              Ithick     Iplas      Ipos\n")
                 output_file.write(f"{prop_type:>10}          {shthk:>20.15g}                .833                   1         1         0\n")
+            write_orientation_card(property_data)
         elif prop_type == '1': #1 is code for Membrane Shells
             shthk = float(property_data['shthk'])  # Get the 'shthk' value from property_data
             output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
@@ -2725,6 +3036,7 @@ def write_props(property_names, output_file):
             if radversion == 2025:
                 output_file.write("#        N                         Thick              Ashear              Ithick     Iplas      Ipos\n")
                 output_file.write(f"{prop_type:>10}          {shthk:>20.15g}                .833                   0         0         0\n")
+            write_orientation_card(property_data)
         elif prop_type == '888': #888 is code for Cohesives
             output_file.write("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n")
             output_file.write(f"/PROP/TYPE43/{property_id}\n")
@@ -2744,6 +3056,10 @@ def write_props(property_names, output_file):
             if radversion == 2025:
                 output_file.write("#     Ndir sphpartID  Icontrol\n")
                 output_file.write("                             1\n")
+            if (material_skew or {}).get(property_data.get('material_id')):
+                print(f"### WARNING ###: /PROP/SOLID for property '{property_display_name}' has no "
+                      "orientation field; the converted /SKEW/FIX cannot be applied. "
+                      "Use /PROP/SOL_ORTH for an oriented solid LAW93 material")
         elif prop_type == '998': #998 is code for Void
             shthk = 0.01  # Default thickness for voids
             if 'shthk' in property_data:
@@ -5130,7 +5446,8 @@ def convert_initial(input_lines, nset_counter, nsets):
 ####################################################################################################
 # Function to convert *DLOADS (only checking Grav type currently)                                  #
 ####################################################################################################
-def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict, fct_id):
+def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict, fct_id,
+                   skew_allocator=None):
     dload_data = {}
 
     amplitude_name = None
@@ -5249,7 +5566,11 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
             ref_nset_counter = nset_counter if dload_name else 0
             if dload_set_exists is False:
                 ref_nset_counter = 0
-        skewandgravid = nset_counter
+        # Gravity skew IDs must come from the same allocator as orientation
+        # skews and *SYSTEM transforms.  Using nset_counter here used to emit
+        # two /SKEW/FIX cards with the same ID (starter duplicate-ID error).
+        skewandgravid = (skew_allocator.allocate()
+                         if skew_allocator is not None else nset_counter)
         dgrav_block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
         dgrav_block += f"/SKEW/FIX/{skewandgravid}\nSkew for Gravity {dload_name}\n"
         dgrav_block += "#                 OX                  OY                  OZ\n"
@@ -6316,6 +6637,14 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"Transforms Done:         {elapsed_time:8.3f} seconds")
 
+    # One allocator for the whole Radioss frame namespace: *SYSTEM transforms
+    # (collected above), *ORIENTATION skews and gravity-DLOAD skews.
+    skew_allocator = SkewIdAllocator(transform_data)
+    orientation_lines, orientations = convert_orientations(input_lines, skew_allocator)
+    if run_timer:
+        elapsed_time = time.time() - start_time
+        print(f"Orientations Done:       {elapsed_time:8.3f} seconds")
+
     node_data, input_lines = read_nodes(input_lines)
     if run_timer:
         elapsed_time = time.time() - start_time
@@ -6342,6 +6671,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         print(f"Nsets Done:              {elapsed_time:8.3f} seconds")
 
     material_names, extra_material_names, fct_id, nset_counter = convert_materials(input_lines, nset_counter)
+    apply_orientations_to_materials(input_lines, material_names, orientations)
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Materials Done:          {elapsed_time:8.3f} seconds")
@@ -6431,7 +6761,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         print(f"Ini Conditions Done:     {elapsed_time:8.3f} seconds")
 
     dload_blocks, nset_counter, fct_id = convert_dloads(input_lines, nset_counter, nsets,
-        property_names, functs_dict, fct_id
+        property_names, functs_dict, fct_id, skew_allocator
         )
     if run_timer:
         elapsed_time = time.time() - start_time
@@ -6483,7 +6813,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
             extra_material_names, property_names, element_lines, elset_blocks,
             surface_lines, contacts, tied_contacts, boundary_blocks, function_blocks,
             initial_blocks, dload_blocks, pload_blocks, rigid_bodies, couplings, discoups,
-            mpc_ties, conn_beams, engine_file
+            mpc_ties, conn_beams, engine_file, orientation_lines, orientations
            )
 
 
@@ -6495,7 +6825,7 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
  elset_blocks, surface_lines, contacts, tied_contacts, boundary_blocks, function_blocks,
  initial_blocks, dload_blocks, pload_blocks, rigid_bodies, couplings, discoups, mpc_ties,
  conn_beams, engine_file, simple_file_name, output_file_name, output_file_path, engine_file_name,
- engine_file_path
+ engine_file_path, orientation_lines=None, orientations=None
  ):
 
     global start_time
@@ -6588,6 +6918,15 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
             written_main_materials.add(material_id)
             return True
 
+        # Map material ID -> Radioss skew ID for orthotropic LAW93 materials
+        # whose referencing Abaqus section defines a converted *ORIENTATION.
+        material_skew = {}
+        for name, properties in material_names.items():
+            if properties.get('orientation_name') and orientations:
+                orientation = orientations.get(properties['orientation_name'])
+                if orientation:
+                    material_skew[properties['material_id']] = orientation['skew_id']
+
         #MAT LAW93 (orthotropic elastic)
         for material_name, properties in material_names.items():
             if check_if_ortho(properties):
@@ -6595,7 +6934,9 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
                 if not claim_material(material_id):
                     continue
                 write_orthotropic_material(material_id, material_name, properties['rho'],
-                    properties['orthotropic_constants'], output_file)
+                    properties['orthotropic_constants'], output_file,
+                    properties.get('orthotropic_temperature_data'),
+                    material_skew.get(material_id))
 
         #MAT LAW1
         for material_name, properties in material_names.items():
@@ -6628,7 +6969,7 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
 
                 # Write the card format for materials with elasto-plastic properties
                 write_plastic_material(material_id, material_name, rho, emodulus, poissrat,
-                    plastic_data, output_file
+                    plastic_data, output_file, properties.get('plastic_temperature_data')
                     )
 
         #MAT LAW42
@@ -6824,12 +7165,13 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
                 # Write the card format for johnson failure properties
                 write_jcdi(material_id, jc_damage_data, output_file)
 
-        #DAMAGE EVOLUTION (tabulated as a function for manual hookup)
+        #DAMAGE EVOLUTION: keep the /FUNCT and wire it into /FAIL/TAB1
         for material_name, properties in extra_material_names.items():
             if check_if_damage_evolution(properties):
                 material_id = properties['material_id']
-                write_damage_evolution(material_id, properties['damage_evolution_data'],
-                                       material_name, output_file)
+                damage_data = properties['damage_evolution_data']
+                write_damage_evolution(material_id, damage_data, material_name, output_file)
+                write_fail_tab1(material_id, damage_data, material_name, output_file)
 
         #DAMPING
         for material_name, properties in extra_material_names.items():
@@ -6876,7 +7218,7 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         output_file.write(part_header)  # Write the part/el/prop section header
         write_parts(property_names, non_numeric_references, output_file)
         output_file.write(prop_header)  # Write the part/el/prop section header
-        write_props(property_names, output_file)
+        write_props(property_names, output_file, material_skew, orientations)
         output_file.write(nodes_header)  # Write the node section header
 
         if run_timer:
@@ -7019,6 +7361,9 @@ def write_output(transform_lines, transform_data, node_lines, nset_blocks, mater
         output_file.write(transforms_header)  # Write the transform section header for transforms
         for transform_line in transform_lines:
             output_file.write(transform_line + '\n')
+        # Abaqus *ORIENTATION frames are emitted as /SKEW/FIX cards here.
+        for orientation_line in (orientation_lines or []):
+            output_file.write(orientation_line)
 
         if run_timer:
             elapsed_time = time.time() - start_time
@@ -8056,7 +8401,8 @@ def start(input_file_path):
         (transform_lines, transform_data, node_lines, nsets, nset_blocks, material_names,
          extra_material_names, property_names, element_lines, elset_blocks, surface_lines,
          contacts, tied_contacts, boundary_blocks, function_blocks, initial_blocks, dload_blocks,
-         pload_blocks, rigid_bodies, couplings, discoups, mpc_ties, conn_beams, engine_file
+         pload_blocks, rigid_bodies, couplings, discoups, mpc_ties, conn_beams, engine_file,
+         orientation_lines, orientations
          ) = main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
          non_numeric_references, relsets_for_expansion_dict, nset_references
          )
@@ -8071,7 +8417,8 @@ def start(input_file_path):
                                    function_blocks, initial_blocks, dload_blocks, pload_blocks,
                                    rigid_bodies, couplings, discoups, mpc_ties, conn_beams,
                                    engine_file, simple_file_name, output_file_name,
-                                   output_file_path, engine_file_name, engine_file_path
+                                   output_file_path, engine_file_name, engine_file_path,
+                                   orientation_lines, orientations
                                    )
 
 ####################################################################################################

@@ -48,7 +48,8 @@ issued at the end of material conversion.
 | `*SUPERELASTIC` | `/MAT/LAW71` | |
 | `*VISCOELASTIC, TIME=PRONY` | `/VISC/PRONY` | |
 | `*DAMAGE INITIATION, CRITERION=JOHNSON COOK` | `/FAIL/JOHNSON` | |
-| `*DAMAGE EVOLUTION, TYPE=DUCTILE` | `/FUNCT` (eps-plastic, damage) | No automatic Radioss failure model mapping; curve must be hooked up manually. |
+| `*DAMAGE EVOLUTION` (any `TYPE`) | `/FUNCT` (curve) + `/FAIL/TAB1` | The table is written and wired automatically as `fct_IDd` regardless of `TYPE` (the type is only carried as a label); see "Damage evolution to /FAIL/TAB1". |
+| `*ORIENTATION, NAME=...` (direction cosines) | `/SKEW/FIX` + property `Vx/Vy/Vz, Iskew` | Used for orthotropic LAW93 materials; see "Material orientation". |
 | `*DAMPING` | `/DAMP` + `/GRNOD/MAT` | |
 | `*MASS, ELSET=...` | `/ADMAS` | Warns and skips if the node group cannot be resolved (no `/ADMAS/0/0`). |
 | `*MASS` without ELSET | `/GRNOD/NODE` + `/ADMAS` | Node group generated from the node/mass rows on the card; each card gets a unique group ID allocated from the shared node-set counter. |
@@ -62,6 +63,75 @@ documented defaults (`SigY = 1E30`, all ratios `1.0`); only the curve-input card
 is conditional on `Nrate > 0`. inp2rad emits the unconditionally documented
 cards explicitly rather than relying on parser defaults.
 
+### Damage evolution to /FAIL/TAB1
+
+`*DAMAGE EVOLUTION` data is no longer left as an orphan `/FUNCT`. **Every**
+damage-evolution table is wired, whatever its `TYPE` (the keyword value is kept
+only as a label in the deck and warning text; no type is silently dropped).
+inp2rad emits a `/FAIL/TAB1/<mat_ID>` card that references the curve through
+`fct_IDd`, and a second, distinct function ID is allocated for the failure-strain
+table that `/FAIL/TAB1` requires. The curve itself is still written as its own
+`/FUNCT`. Because the mapping is approximate, adding the failure model is
+announced with an explicit `### WARNING ###` on stdout at write time.
+
+Mapping assumptions (these are approximations, not exact equivalences):
+
+* `fct_IDd` is the original Abaqus damage table. In Radioss this function is
+  evaluated at the *accumulated damage variable*, so the table abscissa is
+  interpreted as damage and its ordinate as the damage growth rate. The physical
+  meaning of the two columns should be checked against the source model.
+* `Dcrit` is the largest damage ordinate of the table, clamped to `(0, 1]`;
+  no damage value yields the Radioss default of 1.0. `Dadv` (crack-advancement
+  threshold) is deliberately set equal to `Dcrit` so crack advancement starts
+  at the same accumulated damage as failure; `D` and `n` remain 0.
+* `table1_ID` points to a generated constant failure-strain function
+  (`eps_f = 1.0`, two points). This keeps a triaxiality-dependent failure law
+  from being invented while satisfying the mandatory `table1_ID` field of
+  `/FAIL/TAB1`.
+* Shell and solid deletion use the Radioss defaults (one layer / one
+  integration point); XFEM and element-size regularisation are not enabled.
+
+The field layout follows `hm_cfg_files/config/CFG/radioss2021/FAIL/fail_tab1.cfg`
+and was checked with the built OpenCourant starter. Note that the starter marks
+`/FAIL/TAB1` as obsolete (warning 3145); the card is still parsed without error.
+
+### Material orientation
+
+For `*ORIENTATION` cards using the direction-cosine form, inp2rad derives a
+right-handed local frame (local 1-axis from the first data row, local 2-axis
+from the optional second row or a global axis) and writes a `/SKEW/FIX/<id>`
+card. Skew IDs come from a **single shared allocator** seeded with the existing
+`*SYSTEM` transform IDs; the gravity `*DLOAD` skew uses the same allocator, so
+orientation, gravity and transform frames can never receive the same ID (a
+duplicate caused the starter to abort with a frame-ID error). For a shell LAW93
+material whose section uses `ORIENTATION=<name>`, the Vx/Vy/Vz direction
+cosines and `Iskew` are written on the `/PROP/SHELL` card.
+
+Limitations that produce explicit `### WARNING ###` messages:
+
+* `*ORIENTATION` forms based on node/position systems are not converted;
+* a `*SOLID SECTION` with an orientation cannot be expressed on the emitted
+  `/PROP/SOLID` card (Radioss needs `/PROP/SOL_ORTH`), so the skew is generated
+  but the warning states it could not be applied;
+* a LAW93 material with no orientation keeps the `.inp` global axes.
+
+### Temperature dependence
+
+The emitted material laws were checked against the bundled Radioss starter
+documentation (`hm_cfg_files/config/CFG/.../MAT/*.cfg` and the Fortran readers
+under `starter/source/materials/mat/`). None of the laws inp2rad writes —
+LAW1 (`/MAT/ELAST`), LAW36 (`/MAT/PLAS_TAB`), LAW93 (`/MAT/LAW93`) or the
+hyperelastic laws — has a temperature-dependent field in this Radioss version.
+In particular `/MAT/PLAS_TAB` has no `Fct_IDT` temperature curve, and density
+and elastic temperature columns cannot be represented. Rather than emitting
+silently ignored curves, inp2rad reports explicit `### WARNING ###` messages:
+during parsing they name the **source** Abaqus keyword (`*DENSITY`, `*ELASTIC`,
+`*PLASTIC`), while at write time they name the **target** Radioss law
+(`/MAT/ELAST` LAW1, `/MAT/PLAS_TAB` LAW36, `/MAT/LAW93`) for the data that can
+reach a writer. The first (coldest) data row is kept and the dropped rows are
+also listed as deck comments. D1 compressibility of the hyperelastic laws is a
+parse-time-only warning; those writers have no temperature-data path.
+
 ### Warnings and limitations
 
 All ignored material data is reported with a `### WARNING ###` line on stdout.
@@ -69,15 +139,15 @@ Temperature/orientation notes for data that is kept are also written as
 comments into the generated Radioss deck; data that is skipped entirely is only
 reported on stdout. In particular:
 
-* temperature-dependent density and elasticity use the first data row only
-  (normally the coldest one);
+* temperature-dependent density, elasticity and plasticity use the first data
+  row only (normally the coldest one) and are explicitly reported as unsupported;
 * D1 compressibility for neo-Hookean and Mooney-Rivlin materials is not mapped;
-* orthotropic material directions follow the `.inp` global axes and require a
-  material orientation on the Radioss property;
+* orthotropic material directions follow the `.inp` global axes unless a
+  supported `*ORIENTATION` is converted to `/SKEW/FIX`;
 * `*PLASTIC` data with unsupported hardening rules or with extra temperature /
   field columns is skipped rather than converted into meaningless curves;
-* `*DAMAGE EVOLUTION` is preserved as a function but is not wired into a
-  failure model automatically.
+* `*DAMAGE EVOLUTION` is preserved as a function and wired into `/FAIL/TAB1`
+  with the documented assumptions above.
 
 ### Tests
 
@@ -86,3 +156,14 @@ Fast unit tests (no solver required):
 ```sh
 python3 -m unittest discover -s input_converters/inp2rad/tests -v
 ```
+
+Solver validation of the LAW93 trailing cards (opt-in):
+
+```sh
+INP2RAD_SOLVER_TEST=1 python3 -m unittest discover -s input_converters/inp2rad/tests -v
+```
+
+The solver test generates a LAW93 deck with damage evolution and an orientation,
+runs the built OpenCourant starter (`-check`) and asserts `0 ERROR(S)`. Set
+`OPENCURRENT_STARTER` / `OPENCURRENT_ROOT` to override the default install
+paths; the test skips when the starter or its libraries are absent.

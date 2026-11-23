@@ -85,7 +85,7 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *DAMAGE INITIATION, CRITERION = JOHNSON COOK
 
-*DAMAGE EVOLUTION, TYPE = DUCTILE (written as a /FUNCT curve for manual hookup)
+*DAMAGE EVOLUTION (any TYPE: written as a /FUNCT curve and wired to /FAIL/TAB1)
 
 *DAMPING,( with ALPHA =, BETA =, for material damping)
 
@@ -175,6 +175,8 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *NSET, NSET (GENERATE supported)
 
+*ORIENTATION (direction-cosine form; written as /SKEW/FIX for orthotropic LAW93)
+
 *PLASTIC
 
 *RIGID BODY
@@ -207,5 +209,22 @@ The material conversion is summarised in [docs/SUPPORT.md](../../docs/SUPPORT.md
 * `*ELASTIC, ENGINEERING CONSTANTS` with all nine constants is written as a true orthotropic `/MAT/LAW93` material; incomplete data falls back to E1/nu12 with a warning.
 * `*PLASTIC` with `HARDENING=JOHNSON COOK`, `KINEMATIC`, `COMBINED`, or with temperature/field columns is skipped with a warning instead of producing a bogus stress-strain curve.
 * Multi-term Ogden (`N>1`) is written with all mu/alpha/D pairs.
-* `*DAMAGE EVOLUTION` tables are emitted as `/FUNCT` curves; they must be hooked up to a Radioss failure model manually.
-* Data that cannot be represented (temperature-dependent density/elasticity, D1 compressibility, material orientation, etc.) is reported with `### WARNING ###` messages; retained-but-ignored temperature/orientation data is also noted in generated deck comments.
+* `*DAMAGE EVOLUTION` tables of any `TYPE` are emitted as `/FUNCT` curves **and** wired into a `/FAIL/TAB1` card automatically (the `fct_IDd` identifier matches the curve; `Dadv = Dcrit`). A constant failure-strain table is generated because `/FAIL/TAB1` requires one. The mapping is an approximation and is announced with a warning; assumptions are documented in [docs/SUPPORT.md](../../docs/SUPPORT.md).
+* `*ORIENTATION` (direction-cosine form) is converted to `/SKEW/FIX` and applied to the property of an orthotropic LAW93 material. Its IDs come from one shared allocator covering `*SYSTEM` transforms, orientations and gravity `*DLOAD` skews, so frame IDs cannot collide. Unsupported orientation forms and solid `/PROP/SOLID` properties report explicit warnings.
+* Data that cannot be represented (temperature-dependent density/elasticity/plasticity, D1 compressibility, etc.) is reported with `### WARNING ###` messages; retained-but-ignored data is also noted in generated deck comments.
+
+## Tests
+
+Fast unit tests (no solver needed):
+
+```sh
+python3 -m unittest discover -s input_converters/inp2rad/tests -v
+```
+
+Solver validation of the generated LAW93 deck (requires a built OpenCourant starter) is opt-in:
+
+```sh
+INP2RAD_SOLVER_TEST=1 python3 -m unittest discover -s input_converters/inp2rad/tests -v
+```
+
+Override `OPENCURRENT_STARTER` and `OPENCURRENT_ROOT` if the solver is installed elsewhere. The test skips automatically when the starter or its runtime dependencies are absent.
