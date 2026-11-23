@@ -65,13 +65,13 @@ The convertor aims to support .inp format with a good degree of flexibility, cas
 
 Supported keywords: (not all sub-options necessarily supported):
 
-*AMPLITUDE (TABULAR, EQUALLY SPACED, SMOOTH STEP, EXPONENTIAL, DECAY and AGGREGATE are sampled into /FUNCT)
+*AMPLITUDE (TABULAR, EQUALLY SPACED, SMOOTH STEP, EXPONENTIAL, DECAY, AGGREGATE, PERIODIC and MODULATED are sampled into /FUNCT; SCALEX/SCALEY/SHIFTX/SHIFTY and TIME=TOTAL TIME are honoured; USER, SOLUTION DEPENDENT, BUBBLE and ACTUATOR emit explicit warnings)
 
-*BOUNDARY (default, SPC type and TYPE=DISPLACEMENT, TYPE=VELOCITY, OP=NEW, SYSTEM=<id>)
+*BOUNDARY (default, SPC type and TYPE=DISPLACEMENT, TYPE=VELOCITY, OP=NEW/OP=MOD, SYSTEM=<id>)
 
 *BOUNDARY condition mappings ENCASTR/ENCASTRE, PINNED, XSYMM, YSYMM, ZSYMM, XSIDE, YSIDE, ZSIDE, XSPHERE, YSPHERE, ZSPHERE
     
-*CLOAD (forces X/Y/Z and moments XX/YY/ZZ on DOF 4/5/6)
+*CLOAD (forces X/Y/Z and moments XX/YY/ZZ on DOF 4/5/6; rotational DOFs are enabled automatically for moment loads)
 
 *COHESIVE SECTION
 
@@ -93,7 +93,7 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *DISTRIBUTING COUPLING
 
-*DLOAD (GRAV, face pressures P/P1..P6, CENT/CENTRIF/ROTA; unsupported types are reported)
+*DLOAD (GRAV, face pressures P/P1..P6, CENT/CENTRIF/ROTA with a /FRAME/FIX preserving the axis and centre; unsupported types are reported)
 
 *DSLOAD, (Pressure Load Types P, P1, P2, P3, P4, P5, P6; HP/TRVEC/TRSHR are approximated as uniform /PLOAD)
 

@@ -1,5 +1,6 @@
 """Focused tests for gravity, pressure and centrifugal loads."""
 
+import math
 import os
 import sys
 import unittest
@@ -74,8 +75,33 @@ class GravityTests(unittest.TestCase):
         blocks, _, _ = converter.convert_dloads(lines, 10, {}, props(), *amplitudes())
         joined = '\n'.join(blocks)
         self.assertIn('/LOAD/CENTRI/', joined)
-        self.assertIn('ZZ', joined)
-        self.assertIn('                  10', joined)
+        # Abaqus CENTRIF magnitude is the angular velocity itself and the
+        # rotation axis/origin are preserved through a /FRAME/FIX card.
+        self.assertIn('/FRAME/FIX/', joined)
+        self.assertIn('        YY', joined)
+        self.assertIn('                 100', joined)
+
+    def test_centrifugal_off_axis_frame_and_ivar(self):
+        lines = [
+            '*DLOAD, AMPLITUDE=RAMP\n',
+            'PART_A, CENTRIF, 50.0, 1., 2., 3., 2., 3., 3.\n',
+        ]
+        functs, fct_id = amplitudes()
+        functs['RAMP'] = {'id': 31, 'data': [(0.0, 0.0), (1.0, 1.0)]}
+        blocks, _, _ = converter.convert_dloads(lines, 10, {}, props(), functs, fct_id)
+        joined = '\n'.join(blocks)
+        frame = [line for line in joined.splitlines() if line.startswith('/FRAME/FIX/')]
+        self.assertEqual(len(frame), 1)
+        frame_id = frame[0].split('/')[-1]
+        self.assertIn(f"{frame_id:>10}", joined)
+        # Y axis of the frame is the (1, 1, 0) rotation axis; origin is (1, 2, 3).
+        axis_line = joined.split('(rotation axis)\n')[1].splitlines()[0]
+        self.assertAlmostEqual(float(axis_line[0:20]), 1 / math.sqrt(2))
+        self.assertAlmostEqual(float(axis_line[20:40]), 1 / math.sqrt(2))
+        self.assertAlmostEqual(float(axis_line[40:60]), 0.0)
+        # Time-varying velocity requires Ivar=2.
+        centri_line = [line for line in joined.splitlines() if line.startswith('        31')][0]
+        self.assertIn(f"{2:>10}", centri_line)
 
 
 class PressureTests(unittest.TestCase):

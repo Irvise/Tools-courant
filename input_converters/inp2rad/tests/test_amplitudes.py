@@ -1,5 +1,7 @@
 """Focused tests for amplitude parsing (no solver required)."""
 
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -113,6 +115,68 @@ class AmplitudeTests(unittest.TestCase):
             'A', functs, '*BOUNDARY', 30, step_start=5.0)
         self.assertEqual(functs[shifted_id if isinstance(shifted_id, str) else 'A__step_t5']['id'], shifted_id)
         self.assertEqual(functs['A__step_t5']['data'], [(5.0, 0.0), (6.0, 1.0)])
+
+    def test_periodic_fourier_sampling(self):
+        lines = [
+            '*AMPLITUDE, NAME=P, DEFINITION=PERIODIC\n',
+            '1, 6.283185307179586, 0., 0.\n',
+            '1., 0.\n',
+        ]
+        data = converter.read_amplitudes(lines, 0)[0]['P']['data']
+        self.assertGreater(len(data), 20)
+        self.assertAlmostEqual(data[0][1], 1.0)  # cos(0) = 1
+        peak = max(value for _, value in data)
+        trough = min(value for _, value in data)
+        self.assertAlmostEqual(peak, 1.0, places=6)
+        self.assertAlmostEqual(trough, -1.0, places=6)
+
+    def test_modulated_sampling(self):
+        lines = [
+            '*AMPLITUDE, NAME=M, DEFINITION=MODULATED\n',
+            '1., 2., 0.5, 6.283185307179586, 12.566370614359172\n',
+        ]
+        data = converter.read_amplitudes(lines, 0)[0]['M']['data']
+        self.assertGreater(len(data), 100)
+        self.assertAlmostEqual(dict(data)[0.5], 1.0)
+        before = [value for t, value in data if t < 0.5]
+        self.assertTrue(before)
+        self.assertTrue(all(abs(value - 1.0) < 1e-12 for value in before))
+
+    def test_amplitude_scaling_parameters(self):
+        lines = [
+            '*AMPLITUDE, NAME=S, SCALEX=2, SCALEY=3, SHIFTX=1, SHIFTY=-0.5\n',
+            '0, 1, 1, 2\n',
+        ]
+        data = converter.read_amplitudes(lines, 0)[0]['S']['data']
+        self.assertEqual(data, [(1.0, 2.5), (3.0, 5.5)])
+
+    def test_total_time_amplitude_is_not_shifted(self):
+        lines = ['*AMPLITUDE, NAME=T, TIME=TOTAL TIME\n', '0, 0, 2, 1\n']
+        functs, _ = converter.read_amplitudes(lines, 0)
+        self.assertEqual(functs['T']['time'], 'TOTAL TIME')
+        # With TIME=TOTAL TIME the amplitude is already on the global axis.
+        blocks, _, _, _ = converter.convert_pload(
+            ['*STEP\n', '*STATIC\n', '1., 1., 1.\n', '*DSLOAD, AMPLITUDE=T\n',
+             'SET, P, 1.\n', '*END STEP\n', '*STEP\n', '*STATIC\n', '1., 1., 1.\n',
+             '*DSLOAD, AMPLITUDE=T\n', 'SET, P, 1.\n'],
+            10, 5, {}, {'SET': [1]}, {1: {'spos': [1, 2, 3]}}, functs, 20)
+        self.assertEqual('\n'.join(blocks).count('/PLOAD/'), 2)
+        # Only one function is needed: the total-time curve covers both steps.
+        self.assertNotIn('T__step_t1', functs)
+        self.assertEqual(functs['T']['data'], [(0.0, 0.0), (2.0, 1.0)])
+
+    def test_unsupported_forms_warn_explicitly(self):
+        for definition, data in (('USER', '1., 2.\n'),
+                                 ('SOLUTION DEPENDENT', '0.5, 0.1, 100.\n'),
+                                 ('ACTUATOR', '')):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                functs = converter.read_amplitudes(
+                    [f'*AMPLITUDE, NAME=U, DEFINITION={definition}\n', data], 0)[0]
+            warning = stream.getvalue()
+            self.assertIn(definition, warning)
+            self.assertIn('### WARNING ###', warning)
+            self.assertIn(functs['U']['id'], [f['id'] for f in functs.values()])
 
 
 if __name__ == '__main__':

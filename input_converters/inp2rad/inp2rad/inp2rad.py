@@ -4168,12 +4168,140 @@ def parse_step_info(input_lines):
     return steps
 
 
-def step_range(steps, step_index):
-    """Global (start, stop) time of a step, falling back to (0, 1E31)."""
-    if 0 <= step_index < len(steps):
-        step = steps[step_index]
-        return step['start'], step['start'] + step['period']
-    return 0.0, 1e31
+def parse_step_details(input_lines):
+    """Return detailed step descriptors, one entry per *STEP in the deck.
+
+    Each descriptor holds ``index`` (0-based), ``start``/``period``/``stop`` on
+    the accumulated Radioss time axis, ``name`` and ``procedure``.  A step whose
+    time could not be parsed is kept with a zero period so that the step indices
+    of BCs/loads still line up with the *STEP keywords.
+    """
+    steps = parse_step_info(input_lines)
+    details = []
+    step_no = -1
+    i = 0
+    while i < len(input_lines):
+        stripped = input_lines[i].strip()
+        if stripped.lower().startswith('*step'):
+            step_no += 1
+            name = get_keyword_param(stripped, 'NAME')
+            procedure = None
+            for candidate in input_lines[i + 1:i + 3]:
+                candidate = candidate.strip()
+                if candidate.startswith('*'):
+                    break
+                if candidate and not candidate.startswith('**'):
+                    procedure = candidate.split(',')[0].strip().upper()
+                    break
+            info = steps[step_no] if step_no < len(steps) else {
+                'start': details[-1]['stop'] if details else 0.0, 'period': 0.0}
+            details.append({
+                'index': step_no,
+                'start': info['start'],
+                'period': info['period'],
+                'stop': info['start'] + info['period'],
+                'name': name,
+                'procedure': procedure,
+            })
+        i += 1
+    return details
+
+
+def warn_unsupported_step_features(input_lines):
+    """Report step/load-case features that cannot be represented in a starter."""
+    warned = set()
+    for line in input_lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith('*step') and re.search(r'\bPERTURBATION\b', stripped, re.I):
+            key = 'perturbation'
+            if key not in warned:
+                print("### WARNING ###: *STEP, PERTURBATION is not supported; it is converted "
+                      "as a regular analysis step.")
+                warned.add(key)
+        if lower.startswith('*step'):
+            procedure = None
+            key = None
+            if re.search(r'\bBUCKLE\b', stripped, re.I):
+                procedure, key = 'BUCKLE', 'buckle'
+            elif re.search(r'\bFREQUENCY\b', stripped, re.I):
+                procedure, key = 'FREQUENCY', 'frequency'
+            if key and key not in warned:
+                print(f"### WARNING ###: {procedure} steps are not supported; the step is "
+                      "converted with its time span only (no eigenmodes/eigenvalues).")
+                warned.add(key)
+        if lower.startswith('*load case'):
+            key = 'load case'
+            if key not in warned:
+                print("### WARNING ###: *LOAD CASE (scale factors/combinations) is not supported; "
+                      "loads are emitted at their full deck magnitude.")
+                warned.add(key)
+
+
+def build_step_override_map(input_lines):
+    """Map later BC/load definitions and OP=NEW resets onto step indices.
+
+    Returns ``(redefinitions, op_new_steps)`` where ``redefinitions`` maps
+    ``(kind, target, component)`` to the sorted steps in which that component is
+    defined again, and ``op_new_steps`` maps a keyword family to the steps in
+    which OP=NEW removes its earlier definitions.  This lets a single load
+    entry be gated to the steps in which Abaqus would actually apply it instead
+    of leaking into all subsequent Radioss time.
+    """
+    redefinitions = {}
+    op_new_steps = {}
+    step_index = -1
+    kind = None
+    for line in input_lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith('*step'):
+            step_index += 1
+            continue
+        if lower.startswith('*boundary') or lower.startswith('*cload'):
+            kind = 'BOUNDARY' if lower.startswith('*boundary') else 'CLOAD'
+        elif lower.startswith('*dload') or lower.startswith('*dsload'):
+            kind = 'DLOAD' if lower.startswith('*dload') else 'DSLOAD'
+        elif stripped.startswith('*'):
+            kind = None
+            continue
+        else:
+            if kind is None or not stripped:
+                continue
+            fields = [field.strip().strip('"') for field in stripped.split(',')]
+            if len(fields) < 2 or not fields[0]:
+                continue
+            component = fields[1].upper()
+            redefinitions.setdefault((kind, fields[0], component), []).append(step_index)
+            continue
+        if kind and re.search(r'\bOP\s*=\s*NEW\b', stripped, re.I):
+            op_new_steps.setdefault(kind, []).append(step_index)
+    return redefinitions, op_new_steps
+
+
+def entry_active_until(kind, target, component, step, override_map, steps):
+    """Last step index in which an individual load/BC entry remains active."""
+    redefinitions, op_new_steps = override_map
+    last = len(steps) - 1 if steps else max(step, 0)
+    candidates = [last]
+    for later in redefinitions.get((kind, target, component), []):
+        if later > step:
+            candidates.append(later - 1)
+    for reset in op_new_steps.get(kind, []):
+        if reset > step:
+            candidates.append(reset - 1)
+    return max(min(candidates), 0)
+
+
+def entry_time_window(step, active_until, steps):
+    """Return the global (start, stop) window over which an entry is active."""
+    if not steps:
+        return 0.0, 1e31
+    first = steps[step] if 0 <= step < len(steps) else None
+    final = steps[active_until] if 0 <= active_until < len(steps) else None
+    if first is None:
+        return 0.0, 1e31
+    return first['start'], (final['stop'] if final is not None else 1e31)
 
 
 def warn_missing_nset(name, context):
@@ -4181,13 +4309,86 @@ def warn_missing_nset(name, context):
     print("                 Define the NSET in the .inp deck before using it in a load or BC.")
 
 
-def resolve_function_id(amplitude_name, functs_dict, context, fct_id, step_start=0.0):
+def interpolate_function(points, time):
+    """Linear interpolation of a /FUNCT point list with constant extrapolation."""
+    if not points:
+        return 1.0
+    if time <= points[0][0]:
+        return points[0][1]
+    for (t0, v0), (t1, v1) in zip(points, points[1:]):
+        if time <= t1:
+            if t1 <= t0:
+                return v1
+            return v0 + (v1 - v0) * (time - t0) / (t1 - t0)
+    return points[-1][1]
+
+
+def build_step_window_data(base_data, step_start, step_stop, steps, time_mode):
+    """Map step-local amplitude data onto the global Radioss time axis.
+
+    The resulting curve is zero outside ``[step_start, step_stop]``.  Inside,
+    every Abaqus step keeps its own local time origin (``TIME=STEP TIME``, the
+    default); amplitudes declared ``TIME=TOTAL TIME`` are left on the global
+    axis.  This is what makes OP=NEW/OP=MOD redefinitions and persistent loads
+    behave correctly on a single Radioss time axis.
+    """
+    if not steps or step_stop is None or step_stop <= step_start:
+        return list(base_data)
+
+    cuts = {step_start, step_stop}
+    for step in steps:
+        for boundary in (step['start'], step['stop']):
+            if step_start < boundary < step_stop:
+                cuts.add(boundary)
+    cuts = sorted(cuts)
+
+    xy = [(0.0, 0.0)]
+    if step_start > 0.0:
+        xy.append((step_start, 0.0))
+    for begin, end in zip(cuts, cuts[1:]):
+        if end <= begin:
+            continue
+        step_info = next((s for s in steps
+                          if s['start'] <= begin + 1e-9 and s['stop'] >= end - 1e-9), None)
+        offset = step_info['start'] if (step_info and time_mode != 'TOTAL TIME') else 0.0
+        samples = [(begin, interpolate_function(base_data, begin - offset))]
+        for local_time, value in base_data:
+            global_time = local_time + offset
+            if begin < global_time < end:
+                samples.append((global_time, value))
+        samples.append((end, interpolate_function(base_data, end - offset)))
+        deduped = []
+        for time, value in samples:
+            if deduped and abs(deduped[-1][0] - time) < 1e-9:
+                deduped[-1] = (time, value)
+            else:
+                deduped.append((time, value))
+        xy.extend(deduped)
+
+    # Radioss holds the final ordinate after the last point; add an explicit
+    # zero just after the window so the load really switches off.  The last
+    # segment already supplies the (step_stop, value) point.
+    xy.append((max(step_stop * 1.000001, step_stop + 1e-6), 0.0))
+    deduped = []
+    for time, value in xy:
+        if deduped and abs(deduped[-1][0] - time) < 1e-9 and deduped[-1][1] == value:
+            continue
+        if deduped and abs(deduped[-1][0] - time) < 1e-9:
+            deduped[-1] = (time, value)
+        else:
+            deduped.append((time, value))
+    return deduped
+
+
+def resolve_function_id(amplitude_name, functs_dict, context, fct_id, step_start=0.0,
+                        step_stop=None, steps=None):
     """Resolve a function ID for an amplitude name.
 
     Unknown amplitudes are *not* silently mapped to function 1: a warning is
-    printed and the default constant function is used.  For later steps the
-    amplitude abscissae are shifted by the cumulative step start time so that
-    the curve remains correct on the single Radioss time axis.
+    printed and the default constant function is used.  With ``step_stop`` and
+    ``steps`` supplied, the curve is mapped onto the global Radioss time axis
+    and gated to the active step window (see :func:`build_step_window_data`).
+    The legacy ``step_start``-only call still just shifts the abscissae.
 
     Returns (function_id, updated_fct_id).
     """
@@ -4200,7 +4401,33 @@ def resolve_function_id(amplitude_name, functs_dict, context, fct_id, step_start
         # Extremely defensive: the default should always exist.
         fct_id += 1
         functs_dict[name] = {'id': fct_id, 'data': [(0.0, 1.0), (1.0, 1.0)]}
-    if step_start > 0.0:
+
+    shifted_name = None
+    if step_stop is not None and steps:
+        time_mode = functs_dict[name].get('time', 'STEP TIME')
+        if time_mode == 'TOTAL TIME':
+            # Abaqus TOTAL TIME curves are already on the global axis; reusing
+            # the original function avoids an incorrect second shift.  Step
+            # gating is then controlled by Tstart/Tstop where available.
+            return functs_dict[name]['id'], fct_id
+        shifted_name = f"{name}__step_t{step_start:g}"
+        if (shifted_name in functs_dict
+                and abs(functs_dict[shifted_name].get('window_stop', -1.0) - step_stop) > 1e-9):
+            shifted_name = f"{shifted_name}__to_t{step_stop:g}"
+        if shifted_name not in functs_dict:
+            fct_id += 1
+            functs_dict[shifted_name] = {
+                'id': fct_id,
+                'data': build_step_window_data(
+                    functs_dict[name]['data'], step_start, step_stop, steps, time_mode),
+                'definition': functs_dict[name].get('definition', 'TABULAR'),
+                'time': time_mode,
+                'window_start': step_start,
+                'window_stop': step_stop,
+            }
+        return functs_dict[shifted_name]['id'], fct_id
+
+    if step_start > 0.0 and functs_dict[name].get('time', 'STEP TIME') != 'TOTAL TIME':
         shifted_name = f"{name}__step_t{step_start:g}"
         if shifted_name not in functs_dict:
             fct_id += 1
@@ -4341,6 +4568,72 @@ def sample_aggregate(points):
     return xy
 
 
+def sample_periodic(values, duration=None, samples_per_period=48, max_periods=40):
+    """Sample an Abaqus PERIODIC Fourier amplitude into linear /FUNCT points.
+
+    Data are ``N, omega, t0, A0`` followed by ``2N`` coefficients
+    ``(A1, B1, A2, B2, ...)``.  Abaqus evaluates
+    ``A0 + sum(An*cos(n*w*(t-t0)) + Bn*sin(n*w*(t-t0)))`` for ``t >= t0`` and
+    ``A0`` before that.  A whole number of periods is sampled so that the last
+    point matches the first one and linear interpolation stays faithful.
+    """
+    if len(values) < 4:
+        return []
+    n_terms = int(values[0])
+    omega, t0, a0 = values[1], values[2], values[3]
+    coefficients = values[4:4 + 2 * n_terms]
+    if len(coefficients) < 2 * n_terms or n_terms < 0:
+        return []
+    if omega <= 0.0:
+        return [(0.0, a0), (max(duration or 1.0, 1.0), a0)]
+    period = 2.0 * math.pi / omega
+    if duration and duration > 0.0:
+        periods = min(max_periods, max(1, math.ceil((duration + t0) / period)))
+    else:
+        periods = 2
+    end = t0 + periods * period
+    total_samples = periods * samples_per_period
+    xy = [(0.0, a0)] if t0 > 0.0 else []
+    if t0 > 0.0:
+        xy.append((t0, a0))
+    for index in range(total_samples + 1):
+        t = t0 + (end - t0) * index / total_samples
+        tau = t - t0
+        value = a0
+        for harmonic in range(n_terms):
+            an = coefficients[2 * harmonic]
+            bn = coefficients[2 * harmonic + 1]
+            value += an * math.cos((harmonic + 1) * omega * tau)
+            value += bn * math.sin((harmonic + 1) * omega * tau)
+        xy.append((t, value))
+    return xy
+
+
+def sample_modulated(values, duration=None, max_points=4000):
+    """Sample an Abaqus MODULATED amplitude into linear /FUNCT points.
+
+    Abaqus data are ``A0, A, t0, omega1, omega2`` with
+    ``a = A0`` for ``t <= t0`` and
+    ``a = A0 + A*sin(omega1*(t-t0))*sin(omega2*(t-t0))`` afterwards.
+    """
+    if len(values) < 5:
+        return []
+    a0, amplitude, t0, omega1, omega2 = values[:5]
+    span = duration if duration and duration > 0.0 else max(t0 + 1.0, 1.0)
+    highest = max(abs(omega1), abs(omega2))
+    # At least 32 samples per oscillation of the fastest component.
+    samples = min(max_points, max(128, int(32 * highest * span / (2 * math.pi))))
+    xy = [(0.0, a0)]
+    if t0 > 0.0:
+        xy.append((t0, a0))
+    for index in range(1, samples + 1):
+        t = span * index / samples
+        tau = t - t0
+        value = a0 if tau <= 0.0 else a0 + amplitude * math.sin(omega1 * tau) * math.sin(omega2 * tau)
+        xy.append((t, value))
+    return xy
+
+
 ####################################################################################################
 # Function to read *AMPLITUDE definitions into Radioss /FUNCT data                                   #
 ####################################################################################################
@@ -4365,11 +4658,23 @@ def read_amplitudes(input_lines, fct_id):
     if current_block is not None:
         blocks.append(current_block)
 
+    step_periods = [step['period'] for step in parse_step_info(input_lines) if step['period'] > 0.0]
+    longest_step = max(step_periods) if step_periods else None
+
     for block in blocks:
         header = block['header']
         amplitude_name = get_keyword_param(header, 'NAME') or f'AMPLITUDE_{len(functs_dict) + 1}'
         definition = (get_keyword_param(header, 'DEFINITION')
                       or get_keyword_param(header, 'TYPE') or 'TABULAR').upper()
+        time_mode = (get_keyword_param(header, 'TIME') or 'STEP TIME').upper().replace('_', ' ')
+        if time_mode not in ('STEP TIME', 'TOTAL TIME'):
+            print(f"### WARNING ###: Amplitude '{amplitude_name}' has unsupported TIME={time_mode}; "
+                  "using STEP TIME.")
+            time_mode = 'STEP TIME'
+        scale_x = float(get_keyword_param(header, 'SCALEX') or 1.0)
+        scale_y = float(get_keyword_param(header, 'SCALEY') or 1.0)
+        shift_x = float(get_keyword_param(header, 'SHIFTX') or 0.0)
+        shift_y = float(get_keyword_param(header, 'SHIFTY') or 0.0)
         values = []
         for data_line in block['data']:
             values.extend(float(value) for value in re.split(r'[,\s]+', data_line) if value.strip())
@@ -4385,6 +4690,16 @@ def read_amplitudes(input_lines, fct_id):
                 xy = sample_decay(values)
             else:
                 xy = sample_aggregate(points)
+        elif definition == 'PERIODIC':
+            xy = sample_periodic(values, duration=longest_step)
+            if not xy:
+                print(f"### WARNING ###: PERIODIC amplitude '{amplitude_name}' has incomplete "
+                      "Fourier data; using the constant default.")
+        elif definition == 'MODULATED':
+            xy = sample_modulated(values, duration=longest_step)
+            if not xy:
+                print(f"### WARNING ###: MODULATED amplitude '{amplitude_name}' has incomplete "
+                      "A0, A, t0, w1, w2 data; using the constant default.")
         elif definition == 'EQUALLY SPACED':
             interval_match = re.search(r'\bFIXED\s+INTERVAL\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', header, re.IGNORECASE)
             begin_match = re.search(r'\bBEGIN\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', header, re.IGNORECASE)
@@ -4402,18 +4717,34 @@ def read_amplitudes(input_lines, fct_id):
                 values = values[:-1]
             xy = list(zip(values[::2], values[1::2]))
         else:
-            print(f"### WARNING ###: Amplitude '{amplitude_name}' uses unsupported form "
-                  f"'{definition}'; using the constant default.")
-            xy = [(0.0, 1.0), (1.0, 1.0)]
+            # No defensible time sampling exists for these forms in a Radioss
+            # /FUNCT.  Keep the constant as an explicitly-labelled fallback and
+            # say exactly what was dropped (never a silent fallback).
+            if definition == 'SOLUTION DEPENDENT':
+                initial = values[0] if values else 1.0
+                print(f"### WARNING ###: Amplitude '{amplitude_name}' is SOLUTION DEPENDENT "
+                      f"(initial={initial:g}); Radioss /FUNCT(time) cannot express this. "
+                      f"Using a constant {initial:g}; solution-dependent scaling is lost.")
+                xy = [(0.0, initial), (1.0, initial)]
+            else:
+                print(f"### WARNING ###: Amplitude '{amplitude_name}' uses unsupported form "
+                      f"'{definition}' ({len(values)} data values); Radioss /FUNCT cannot express it. "
+                      "Using the constant default 1.0; the time variation is lost.")
+                xy = [(0.0, 1.0), (1.0, 1.0)]
 
         if not xy:
             print(f"### WARNING ###: No usable data in amplitude '{amplitude_name}'; using constant default.")
             xy = [(0.0, 1.0), (1.0, 1.0)]
+
+        # Abaqus SCALEX/SHIFTX act on the abscissa, SCALEY/SHIFTY on the ordinate.
+        if (scale_x, scale_y, shift_x, shift_y) != (1.0, 1.0, 0.0, 0.0):
+            xy = [(time * scale_x + shift_x, value * scale_y + shift_y) for time, value in xy]
         fct_id += 1
         functs_dict[amplitude_name] = {
             'id': fct_id,
             'data': xy,
             'definition': definition,
+            'time': time_mode,
         }
 
     # Always create a default amplitude for loads/BCs without an AMPLITUDE reference.
@@ -4423,6 +4754,7 @@ def read_amplitudes(input_lines, fct_id):
         'id': fct_id,
         'data': [(0.0, 1.0), (1.0, 1.0)],
         'definition': 'TABULAR',
+        'time': 'STEP TIME',
     }
     return functs_dict, fct_id
 
@@ -4448,10 +4780,11 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
     # steps, so step 1 maps to index 0.
     step_index = -1
 
-    steps = parse_step_info(input_lines)
+    steps = parse_step_details(input_lines)
+    override_map = build_step_override_map(input_lines)
     if len(steps) > 1:
-        print("### WARNING ###: Multiple steps found. Amplitude time is mapped to the global "
-              "Radioss time using cumulative step starts (approximation).")
+        print("### WARNING ###: Multiple steps found. Loads are mapped to the global Radioss "
+              "time with per-step time origins and OP=NEW/OP=MOD windows (approximation).")
     elif any(line.strip().lower().startswith('*step') for line in input_lines) and not steps:
         print("### WARNING ###: *STEP time could not be parsed; imposed conditions keep "
               "Tstart=0 and Tstop=1E31.")
@@ -4588,7 +4921,8 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
                     if label is None:
                         print(f"### WARNING ###: Unsupported DOF {dof} for imposed condition on '{name}'; skipped.")
                         continue
-                    target.setdefault(name, []).append((label, magnitude, amplitude_name, step_index, skew_id))
+                    target.setdefault(name, []).append(
+                        (label, magnitude, amplitude_name, step_index, skew_id, dof_field))
             continue
 
         if section == '*cload' and line:
@@ -4611,7 +4945,7 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
                 clear_entries(cload_data, name)
             cload_data.setdefault(name, []).append(
                 (label, value, amplitude_name, step_index, skew_id,
-                 fields[1].strip() in ('4', '5', '6')))
+                 fields[1].strip() in ('4', '5', '6'), fields[1]))
 
     boundary_blocks = []
 
@@ -4660,8 +4994,9 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
             ('IMPVEL', impv_data, '/IMPVEL')):
         for name, values in entries.items():
             group_ref = None
-            for direction, magnitude, amplitude, step, skew in values:
-                start, stop = step_range(steps, step)
+            for direction, magnitude, amplitude, step, skew, dof in values:
+                until = entry_active_until('BOUNDARY', name, dof, step, override_map, steps)
+                start, stop = entry_time_window(step, until, steps)
                 if group_ref is None:
                     if name.isdigit():
                         grnod, group_ref = single_node_group(name, kind)
@@ -4680,8 +5015,8 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
                 if not group_ref:
                     continue
                 function_id, fct_id = resolve_function_id(
-                    amplitude, functs_dict, f'{keyword} on {name}', fct_id, steps[step]['start']
-                    if 0 <= step < len(steps) else 0.0)
+                    amplitude, functs_dict, f'{keyword} on {name}', fct_id,
+                    start, stop, steps if steps else None)
                 block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
                 block += f"{keyword}/{ref_nset_counter}\n{name}\n"
                 block += f"# References Amplitude: {amplitude}\n"
@@ -4699,9 +5034,12 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
                 boundary_blocks.append(block)
 
     # CLOAD blocks (XX/YY/ZZ denote moments, which /CLOAD supports natively)
+    moment_nodes = []
     for cload_name, cload_entries in cload_data.items():
         group_ref = None
-        for direction, value, amplitude, step, skew, is_moment in cload_entries:
+        for direction, value, amplitude, step, skew, is_moment, dof in cload_entries:
+            until = entry_active_until('CLOAD', cload_name, dof, step, override_map, steps)
+            start, stop = entry_time_window(step, until, steps)
             if group_ref is None:
                 if cload_name.isdigit():
                     grnod, group_ref = single_node_group(cload_name, 'CLOAD')
@@ -4719,19 +5057,50 @@ def convert_boundary(input_lines, nset_counter, nsets, functs_dict, fct_id):
                     ref_nset_counter = nset_counter
             if not group_ref:
                 continue
+            if is_moment:
+                # Radioss only allocates rotational DOFs (IRODDL) when the deck
+                # contains beams, rigids, springs or /INIVEL/NODE.  A pure
+                # solid/shell model with XX/YY/ZZ loads otherwise aborts with
+                # "undefined concentrated load direction" (starter error 845).
+                node = cload_name if cload_name.isdigit() else None
+                if node is None:
+                    set_values = nsets.get(cload_name, {}).get('values') or []
+                    node = str(set_values[0]) if set_values else None
+                if node and node.isdigit():
+                    moment_nodes.append(node)
+                else:
+                    print(f"### WARNING ###: Moment load on '{cload_name}' has no resolvable "
+                          "node for the rotational-DOF enabler; the starter may reject XX/YY/ZZ.")
             function_id, fct_id = resolve_function_id(
-                amplitude, functs_dict, f'*CLOAD on {cload_name}', fct_id,
-                steps[step]['start'] if 0 <= step < len(steps) else 0.0)
+                amplitude, functs_dict, f'*CLOAD on {cload_name}', fct_id, start, stop,
+                steps if steps else None)
             block = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
             block += f"/CLOAD/{ref_nset_counter}\n{cload_name}\n"
             block += f"# References Amplitude: {amplitude}\n"
             if is_moment:
                 block += "# Moment load: /CLOAD direction XX/YY/ZZ is a moment about X/Y/Z\n"
-            block += "#  fct_IDT       DIR   skew ID   sens_ID   Grnd_id                      Ascale_x            Fscale_y\n"
-            block += f"{function_id:>10}{direction:>10}{skew:>10}         0{group_ref:>10}                             1{value:>20.15g}"
+            # Modern /CLOAD card (Radioss >= 2023) validated against the built
+            # OpenCourant starter: funct, DIR, skew, sensor, grnod, Itypfun,
+            # Ascalex, Fscaley.  Itypfun=1 selects time as function abscissa.
+            block += ("#funct_IDT       Dir   skew_ID sensor_ID  grnod_ID   Itypfun"
+                      "             Ascalex             Fscaley\n")
+            block += (f"{function_id:>10}{direction:>10}{skew:>10}         0{group_ref:>10}"
+                      f"{1:>10}{1.0:>20.15g}{value:>20.15g}")
             if grnod:
                 boundary_blocks.append(grnod)
             boundary_blocks.append(block)
+
+    if moment_nodes:
+        nset_counter += 1
+        enabler = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                   f"/INIVEL/NODE/{nset_counter}\n"
+                   "zero velocities: enable rotational DOFs for moment CLOADs\n")
+        for node in dict.fromkeys(moment_nodes):
+            enabler += (f"{node:>10}{0:>10}" + "".join(f"{0.0:>20.15g}" for _ in range(6)) + "\n")
+        # write_output appends one newline; that blank line terminates the
+        # free-card list.  Two blank lines make the starter warn about a
+        # missing card.
+        boundary_blocks.append(enabler)
 
     return boundary_blocks, nset_counter, fct_id
 
@@ -4882,7 +5251,8 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
     # First *STEP must map to steps[0] from parse_step_info().
     step_index = -1
     unsupported_types = set()
-    steps = parse_step_info(input_lines)
+    steps = parse_step_details(input_lines)
+    override_map = build_step_override_map(input_lines)
 
     amplitude_pattern = r'\bAMPLITUDE\s*=\s*"?([^",\s]+)"?'
     system_pattern = r'\bSYSTEM\s*=\s*"?([^",\s]+)"?'
@@ -4928,6 +5298,7 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
                       "group; gravity applied to the whole model.")
             gravity_entries.append({
                 'name': load_name,
+                'load_type': 'GRAV',
                 'magnitude': magnitude,
                 'direction': direction,
                 'amplitude': amplitude_name,
@@ -4947,13 +5318,17 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
             except ValueError:
                 print(f"### WARNING ###: Invalid {load_type} entry '{stripped}'; skipped.")
                 continue
-            if len(point2) < 3:
+            if len(point1) < 3 or len(point2) < 3:
                 print(f"### WARNING ###: Incomplete rotation axis in {load_type} entry; skipped.")
                 continue
             axis = [point2[i] - point1[i] for i in range(3)]
+            # Abaqus CENTRIF magnitude is the angular velocity itself (rad/s),
+            # not omega^2.  Radioss /LOAD/CENTRI Fscale_y is that same velocity.
             centrifugal_entries.append({
                 'name': load_name,
-                'omega_squared': rotational,
+                'load_type': load_type,
+                'omega': rotational,
+                'origin': point1,
                 'axis': axis,
                 'amplitude': amplitude_name,
                 'step': step_index,
@@ -5057,16 +5432,21 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
                  "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
                  f"/GRAV/{load_id}\nGravity {entry['name']}\n"
                  "#funct_IDT       DIR   skew_ID   Isensor  Grnod_id                      Ascale_X            Fscale_Y\n")
+        until = entry_active_until('DLOAD', entry['name'], 'GRAV', entry['step'],
+                                   override_map, steps)
+        start, stop = entry_time_window(entry['step'], until, steps)
         function_id, fct_id = resolve_function_id(
             entry['amplitude'], functs_dict, f'GRAV on {entry["name"]}', fct_id,
-            steps[entry['step']]['start'] if 0 <= entry['step'] < len(steps) else 0.0)
+            start, stop, steps if steps else None)
         block += (f"{function_id:>10}         X{load_id:>10}         0{group_id:>10}"
                   f"                             0{entry['magnitude']:>20.15g}")
         if group_block:
             block += "\n" + group_block
         dload_blocks.append(block)
 
-    # Centrifugal loads map to Radioss /LOAD/CENTRI.
+    # Centrifugal loads map to Radioss /LOAD/CENTRI.  The Abaqus rotation axis
+    # and its origin are preserved with a /FRAME/FIX card whose Y axis is the
+    # rotation axis; Dir=YY then selects that axis in the load card.
     for entry in centrifugal_entries:
         axis = entry['axis']
         axis_length = math.sqrt(sum(value * value for value in axis))
@@ -5074,31 +5454,51 @@ def convert_dloads(input_lines, nset_counter, nsets, property_names, functs_dict
             print(f"### WARNING ###: Centrifugal load on '{entry['name']}' has a zero axis; skipped.")
             continue
         unit = [value / axis_length for value in axis]
-        direction = ('XX', 'YY', 'ZZ')[max(range(3), key=lambda k: abs(unit[k]))]
-        if max(abs(value) for value in unit) < 0.999:
-            print(f"### WARNING ###: Centrifugal axis on '{entry['name']}' is not aligned with a global "
-                  f"axis; using {direction} (frame/origin not preserved).")
-        omega = math.sqrt(max(entry['omega_squared'], 0.0))
+        reference = min(([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+                        key=lambda axis_vec: abs(sum(a * b for a, b in zip(unit, axis_vec))))
+        z_axis = [unit[1] * reference[2] - unit[2] * reference[1],
+                  unit[2] * reference[0] - unit[0] * reference[2],
+                  unit[0] * reference[1] - unit[1] * reference[0]]
+        z_magnitude = math.sqrt(sum(value * value for value in z_axis))
+        z_axis = [value / z_magnitude for value in z_axis]
+        origin = entry['origin']
+        omega = entry['omega']
 
+        until = entry_active_until('DLOAD', entry['name'], entry['load_type'],
+                                   entry['step'], override_map, steps)
+        start, stop = entry_time_window(entry['step'], until, steps)
         function_id, fct_id = resolve_function_id(
             entry['amplitude'], functs_dict, f'CENTRIF on {entry["name"]}', fct_id,
-            steps[entry['step']]['start'] if 0 <= entry['step'] < len(steps) else 0.0)
-        if not entry['amplitude']:
-            function_id, fct_id = resolve_function_id(None, functs_dict, 'CENTRIF', fct_id, 0.0)
-            functs_dict['DEFAULT CONSTANT OVER STEP']['data'] = [(0.0, 1.0), (1.0, 1.0)]
+            start, stop, steps if steps else None)
+
+        base = functs_dict.get(entry['amplitude'] or 'DEFAULT CONSTANT OVER STEP', {})
+        ordinates = [value for _, value in base.get('data', [])]
+        # Ivar=2 keeps the d(omega)/dt term when the velocity curve varies.
+        ivar = 2 if len(set(ordinates)) > 1 else 1
 
         group_id = 0
         group_block = None
         if entry['name'] and not entry['name'].isdigit():
             group_id, group_block = part_group(entry['name'], f'CENTRIF on {entry["name"]}')
         load_id = reserve_id()
+        frame_id = reserve_id()
+        frame_block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+                       f"/FRAME/FIX/{frame_id}\nFrame for centrifugal load {entry['name']}\n"
+                       "#                 Ox                  Oy                  Oz\n"
+                       + "".join(f"{value:>20.15g}" for value in origin) + "\n"
+                       "#                 X1                  Y1                  Z1  (rotation axis)\n"
+                       + "".join(f"{value:>20.15g}" for value in unit) + "\n"
+                       "#                 X2                  Y2                  Z2\n"
+                       + "".join(f"{value:>20.15g}" for value in z_axis))
         block = ("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
                  f"/LOAD/CENTRI/{load_id}\nCentrifugal from .inp DLOAD {entry['name']}\n"
-                 "#  fct_IDT     Dir   frame_ID    sens_ID    grnod_ID        Ivar              Ascale_x            Fscale_y\n"
-                 f"{function_id:>10}{direction:>8}         0         0{group_id:>12}         1                   1{omega:>20.15g}")
-        if group_block:
-            block += "\n" + group_block
+                 "#funct_IDT     Dir   frame_ID sensor_ID  grnod_ID      Ivar             Ascalex             Fscaley\n"
+                 f"{function_id:>10}{'YY':>10}{frame_id:>10}         0{group_id:>10}"
+                 f"{ivar:>10}{1.0:>20.15g}{omega:>20.15g}")
+        dload_blocks.append(frame_block)
         dload_blocks.append(block)
+        if group_block:
+            dload_blocks.append(group_block)
 
     return dload_blocks, nset_counter, fct_id
 
@@ -5119,7 +5519,8 @@ def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dic
     amplitude_name = None
     # First *STEP must map to steps[0] from parse_step_info().
     step_index = -1
-    steps = parse_step_info(input_lines)
+    steps = parse_step_details(input_lines)
+    override_map = build_step_override_map(input_lines)
 
     amplitude_pattern = r'\bAMPLITUDE\s*=\s*"?([^",\s]+)"?'
     system_pattern = r'\bSYSTEM\s*=\s*"?([^",\s]+)"?'
@@ -5216,9 +5617,12 @@ def convert_pload(input_lines, nset_counter, surf_id, surf_name_to_id, elset_dic
                           + "\n".join(surf_segs))
             pload_blocks.append(surf_block)
 
+        until = entry_active_until(section.strip('*').upper(), elset_name, load_type,
+                                   step_index, override_map, steps)
+        start, stop = entry_time_window(step_index, until, steps)
         function_id, fct_id = resolve_function_id(
             amplitude_name, functs_dict, f'pressure load on {elset_name}', fct_id,
-            steps[step_index]['start'] if 0 <= step_index < len(steps) else 0.0)
+            start, stop, steps if steps else None)
 
         if skew_id:
             print(f"### WARNING ###: SYSTEM {skew_id} cannot be applied to /PLOAD; "
@@ -6192,6 +6596,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"Tied Contacts Done:      {elapsed_time:8.3f} seconds")
 
+    warn_unsupported_step_features(input_lines)
     functs_dict, fct_id = read_amplitudes(input_lines, fct_id)
     if run_timer:
         elapsed_time = time.time() - start_time
