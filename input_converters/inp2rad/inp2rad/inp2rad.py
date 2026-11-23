@@ -17,6 +17,7 @@
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 # IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 import os
+import math
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import sys
@@ -112,17 +113,23 @@ def _parse_float_line(line):
     except ValueError:
         return []
 
-def convert_transforms(input_lines):
-    """Convert *SYSTEM cards to /TRANSFORM/POSITION blocks.
 
-    P0: bounds checks and a stale transform_id (and the coords[2]/coords[5]
-    typo in the no-Z-line fallback) are fixed.
-    P1: TYPE= and other *SYSTEM parameters are preserved in comments and
-    cylindrical/spherical systems are converted as a best-effort fixed frame.
+def _normalize_system_id(raw_id):
+    """Normalize numeric system IDs so 01 and 1 refer to the same /TRANSFORM."""
+    text = str(raw_id).strip()
+    return str(int(text)) if text.isdigit() else text
+
+
+def _system_blocks(input_lines, report=True):
+    """Read *SYSTEM cards into reusable blocks.
+
+    A block holds the system ID/type, its Abaqus origin, the point defining
+    the local Z direction (or the local X direction for rectangular systems)
+    and the optional second coordinate line.  ``report=False`` is used by the
+    coordinate-conversion helper so warnings are emitted only once, by
+    :func:`convert_transforms`.
     """
-    transform_lines = []
-    transform_data = []
-
+    blocks = []
     i = 0
     while i < len(input_lines):
         line = input_lines[i].strip()
@@ -133,66 +140,183 @@ def convert_transforms(input_lines):
         id_match = re.search(r'\bID\s*=\s*([\w\-]+)', line, re.IGNORECASE)
         type_match = re.search(r'\bTYPE\s*=\s*([\w\-]+)', line, re.IGNORECASE)
         nset_match = re.search(r'\bNSET\s*=\s*("[^"]+"|[\w\-]+)', line, re.IGNORECASE)
-        transform_id = id_match.group(1) if id_match else None
+        system_id = id_match.group(1) if id_match else None
         system_type = type_match.group(1).upper() if type_match else 'RECTANGULAR'
+        line_number = i + 1
 
-        if not transform_id:
-            warn(f"*SYSTEM without an ID at input line {i + 1} was ignored")
+        if not system_id:
+            if report:
+                warn(f"*SYSTEM without an ID at input line {line_number} was ignored")
             i += 1
             continue
 
         i += 1
         if i >= len(input_lines) or input_lines[i].strip().startswith('*'):
-            warn(f"*SYSTEM {transform_id} has no coordinate data; no /TRANSFORM written")
+            if report:
+                warn(f"*SYSTEM {system_id} has no coordinate data; no /TRANSFORM written")
             continue
 
         coords = _parse_float_line(input_lines[i])
         if len(coords) < 6:
-            warn(f"*SYSTEM {transform_id} needs 6 coordinates (origin + axis point); got {len(coords)}")
+            if report:
+                warn(f"*SYSTEM {system_id} needs 6 coordinates (origin + axis point); got {len(coords)}")
             i += 1
             continue
 
-        Xa, Ya, Za = coords[0], coords[1], coords[2]
-        Xb, Yb, Zb = coords[3], coords[4], coords[5]  # P0: was coords[2]
-
-        z_coords = []
+        z_ref = None
         if i + 1 < len(input_lines) and not input_lines[i + 1].strip().startswith('*'):
             i += 1
-            z_coords = _parse_float_line(input_lines[i])
-            if len(z_coords) < 3:
-                warn(f"*SYSTEM {transform_id} Z-axis line could not be parsed; using default direction")
-                z_coords = []
+            extra = _parse_float_line(input_lines[i])
+            if len(extra) >= 3:
+                z_ref = extra[:3]
+            elif report:
+                warn(f"*SYSTEM {system_id} Z-axis line could not be parsed; using default direction")
+
+        blocks.append({
+            'id': system_id,
+            'type': system_type,
+            'nset': nset_match.group(1) if nset_match else None,
+            'origin': coords[:3],
+            'point_b': coords[3:6],
+            'z_ref': z_ref,
+            'line': line_number,
+        })
+        i += 1
+
+    return blocks
+
+
+def _system_basis(block, report=True):
+    """Return orthonormal (origin, x, y, z) axes for a *SYSTEM block.
+
+    The axes follow the Abaqus convention: the first coordinate line gives
+    the origin and a point on the local Z axis, while the optional second
+    line gives the X reference direction (CYLINDRICAL/SPHERICAL) or the
+    local Z direction (RECTANGULAR).
+    """
+    origin = block['origin']
+    curved = block['type'] in ('CYLINDRICAL', 'SPHERICAL')
+
+    if curved:
+        z_vec = [b - a for a, b in zip(origin, block['point_b'])]
+        x_vec = ([r - a for a, r in zip(origin, block['z_ref'])]
+                 if block['z_ref'] else None)
+        if x_vec is None:
+            if report:
+                warn(f"*SYSTEM {block['id']} ({block['type']}) has no X reference point; using global X")
+            x_vec = [1.0, 0.0, 0.0]
+    else:
+        # Rectangular: point B defines X, the second line (when present)
+        # defines Z.  Without a second line the historic fallback is +Y.
+        x_vec = [b - a for a, b in zip(origin, block['point_b'])]
+        z_vec = ([r - a for a, r in zip(origin, block['z_ref'])]
+                 if block['z_ref'] else [0.0, 1.0, 0.0])
+
+    z_len2 = sum(v * v for v in z_vec)
+    if z_len2 <= 1e-24:
+        if report:
+            warn(f"*SYSTEM {block['id']} ({block['type']}) has a zero-length axis; using global Z")
+        z_vec = [0.0, 0.0, 1.0]
+        z_len2 = 1.0
+    z_vec = [v / (z_len2 ** 0.5) for v in z_vec]
+
+    dot = sum(x_vec[k] * z_vec[k] for k in range(3))
+    x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
+    if sum(v * v for v in x_vec) <= 1e-24:
+        if report:
+            warn(f"*SYSTEM {block['id']} ({block['type']}) X reference is parallel to its axis; "
+                 "using a fallback X direction")
+        x_vec = [1.0, 0.0, 0.0] if abs(z_vec[0]) < 0.9 else [0.0, 1.0, 0.0]
+        dot = sum(x_vec[k] * z_vec[k] for k in range(3))
+        x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
+    x_len = sum(v * v for v in x_vec) ** 0.5
+    x_vec = [v / x_len for v in x_vec]
+    y_vec = [
+        z_vec[1] * x_vec[2] - z_vec[2] * x_vec[1],
+        z_vec[2] * x_vec[0] - z_vec[0] * x_vec[2],
+        z_vec[0] * x_vec[1] - z_vec[1] * x_vec[0],
+    ]
+    return origin, x_vec, y_vec, z_vec
+
+
+def collect_systems(input_lines):
+    """Return a mapping of system ID to its parsed definition and local axes."""
+    systems = {}
+    for block in _system_blocks(input_lines, report=False):
+        system_id = _normalize_system_id(block['id'])
+        if not system_id.isdigit():
+            continue
+        # Report degenerate axes/reference points here (once per deck);
+        # convert_transforms() no longer needs the basis for the frame.
+        origin, x_vec, y_vec, z_vec = _system_basis(block)
+        block.update({
+            'origin_xyz': origin, 'x_axis': x_vec, 'y_axis': y_vec, 'z_axis': z_vec,
+        })
+        systems[system_id] = block
+    return systems
+
+
+def _local_coordinates_to_global(coords, system):
+    """Convert Abaqus cylindrical/spherical node coordinates to global XYZ.
+
+    Cylindrical input is ``(r, theta, z)``; spherical input is
+    ``(r, theta, phi)`` with theta the azimuth in the local XY plane (from
+    local X toward local Y) and phi the polar angle from the local Z axis
+    (both in degrees).  A fixed /TRANSFORM/POSITION frame cannot bend the
+    coordinate lines, so the node coordinates are converted here and an
+    identity transform is written for these systems.
+    """
+    origin = system['origin_xyz']
+    x_vec, y_vec, z_vec = system['x_axis'], system['y_axis'], system['z_axis']
+    if system['type'] == 'CYLINDRICAL':
+        radius, theta, axial = coords[0], coords[1], coords[2]
+        theta = math.radians(theta)
+        local = [radius * math.cos(theta), radius * math.sin(theta), axial]
+    else:  # SPHERICAL: theta = azimuth (XY), phi = polar angle from local Z
+        radius, theta, phi = coords[0], coords[1], coords[2]
+        theta, phi = math.radians(theta), math.radians(phi)
+        local = [radius * math.sin(phi) * math.cos(theta),
+                 radius * math.sin(phi) * math.sin(theta),
+                 radius * math.cos(phi)]
+    result = [origin[k] + local[0] * x_vec[k] + local[1] * y_vec[k] + local[2] * z_vec[k]
+              for k in range(3)]
+    # Avoid printing cos(90 deg) = 6e-17 style noise in the node card.
+    return [0.0 if abs(value) < 1e-12 else value for value in result]
+
+
+def convert_transforms(input_lines):
+    """Convert *SYSTEM cards to /TRANSFORM/POSITION blocks.
+
+    P0: bounds checks and a stale transform_id (and the coords[2]/coords[5]
+    typo in the no-Z-line fallback) are fixed.
+    P1: TYPE= and other *SYSTEM parameters are preserved in comments.
+    P3: rectangular systems still use a rigid frame for local coordinates;
+    cylindrical/spherical node coordinates are converted to global XYZ by
+    :func:`convert_nodes`, so an identity frame is written for those systems.
+    """
+    transform_lines = []
+    transform_data = []
+
+    for block in _system_blocks(input_lines):
+        transform_id = _normalize_system_id(block['id'])
+        system_type = block['type']
+        if not str(transform_id).isdigit():
+            warn(f"*SYSTEM ID={block['id']} is not numeric; no /TRANSFORM written")
+            continue
 
         if system_type in ('CYLINDRICAL', 'SPHERICAL'):
-            # In Abaqus the first line gives the origin and a point on the
-            # local Z axis; the optional second line gives the X reference.
-            z_vec = [Xb - Xa, Yb - Ya, Zb - Za]
-            if z_coords:
-                x_vec = [z_coords[0] - Xa, z_coords[1] - Ya, z_coords[2] - Za]
-            else:
-                warn(f"*SYSTEM {transform_id} ({system_type}) has no X reference point; using global X")
-                x_vec = [1.0, 0.0, 0.0]
-            # Guard against degenerate axis/reference points before projecting
-            # X onto the plane normal to Z.
-            z_len2 = sum(v * v for v in z_vec)
-            if z_len2 <= 1e-24:
-                warn(f"*SYSTEM {transform_id} ({system_type}) has a zero-length axis; using global Z")
-                z_vec = [0.0, 0.0, 1.0]
-                z_len2 = 1.0
-            dot = sum(x_vec[k] * z_vec[k] for k in range(3)) / z_len2
-            x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
-            if sum(v * v for v in x_vec) <= 1e-24:
-                warn(f"*SYSTEM {transform_id} ({system_type}) X reference is parallel to its axis; using a fallback X direction")
-                x_vec = [1.0, 0.0, 0.0] if abs(z_vec[0]) < 0.9 else [0.0, 1.0, 0.0]
-                dot = sum(x_vec[k] * z_vec[k] for k in range(3)) / z_len2
-                x_vec = [x_vec[k] - dot * z_vec[k] for k in range(3)]
-            Xb, Yb, Zb = (Xa + x_vec[0], Ya + x_vec[1], Za + x_vec[2])
-            Xc, Yc, Zc = (Xa + z_vec[0], Ya + z_vec[1], Za + z_vec[2])
-            warn(f"*SYSTEM {transform_id} ({system_type}) is approximated by a fixed /TRANSFORM/POSITION "
-                 "frame at its reference point")
+            # Node coordinates are already converted to global XYZ; the
+            # transform below is therefore the identity transformation.
+            Xa, Ya, Za = 0.0, 0.0, 0.0
+            Xb, Yb, Zb = 1.0, 0.0, 0.0
+            Xc, Yc, Zc = 0.0, 1.0, 0.0
+            warn(f"*SYSTEM {transform_id} ({system_type}) node coordinates are converted to global XYZ; "
+                 "only a fixed frame at the reference point is written")
         else:
-            if z_coords:
-                Xc, Yc, Zc = z_coords[0], z_coords[1], z_coords[2]
+            Xa, Ya, Za = block['origin']
+            Xb, Yb, Zb = block['point_b']
+            if block['z_ref']:
+                Xc, Yc, Zc = block['z_ref']
             else:
                 # No Z-axis line: point C is one unit above the origin in Y.
                 Xc, Yc, Zc = Xa, Ya + 1.0, Za
@@ -203,7 +327,10 @@ def convert_transforms(input_lines):
         transform_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
         transform_lines.append(f"/TRANSFORM/POSITION/{transform_id}")
         transform_lines.append(f"System {transform_id}")
-        transform_lines.append(f"# TYPE={system_type}" + (f" NSET={nset_match.group(1)}" if nset_match else ""))
+        if system_type in ('CYLINDRICAL', 'SPHERICAL'):
+            transform_lines.append(f"# TYPE={system_type} (node coordinates converted to global; identity frame)")
+        else:
+            transform_lines.append(f"# TYPE={system_type}" + (f" NSET={block['nset']}" if block['nset'] else ""))
         transform_lines.append(f"{'':>90}{transform_id:>10}")
         transform_lines.append(f"          {0.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
         transform_lines.append(f"          {1.0:>20.8f}{0.0:>20.8f}{0.0:>20.8f}")
@@ -213,7 +340,6 @@ def convert_transforms(input_lines):
         transform_lines.append(f"          {Xc:>20.8f}{Yc:>20.8f}{Zc:>20.8f}")
 
         transform_data.append(transform_id)
-        i += 1
 
     return transform_lines, transform_data
 
@@ -232,7 +358,7 @@ def read_nodes(input_lines):
             id_match = re.search(r'\bID\s*=\s*([\w\-]+)', line, re.IGNORECASE)
             # P0: reset the active system for each *SYSTEM block; a system with
             # no ID must not inherit the previous block's transform.
-            transform_id = id_match.group(1) if id_match else '0'
+            transform_id = _normalize_system_id(id_match.group(1)) if id_match else '0'
             inside_node_section = False
             remaining_lines.append(line)
             continue
@@ -272,16 +398,30 @@ def read_nodes(input_lines):
 ####################################################################################################
 # Function to convert nodes                                                                        #
 ####################################################################################################
-def convert_nodes(node_data):
+def convert_nodes(node_data, systems=None):
+    """Format nodes for the starter deck.
+
+    Nodes of a cylindrical/spherical *SYSTEM carry local (r, theta, z) or
+    (r, theta, phi) coordinates.  Those are converted to global XYZ here so
+    the identity /TRANSFORM written for such systems leaves them in place.
+    Rectangular systems keep local coordinates and the rigid frame.
+    """
     node_lines = {}
+    systems = systems or {}
     for transform_id, nodes in node_data.items():
         node_lines[transform_id] = []
         for line in nodes:
             # Process the node data
             nodes = line.strip().split(',')
             node_id = nodes[0].strip()
-            coords = [float(coord.strip()) for coord in nodes[1:]]
+            coords = [float(coord.strip()) for coord in nodes[1:4]]
+            extra = [value.strip() for value in nodes[4:]]
+            system = systems.get(str(transform_id))
+            if system and system['type'] in ('CYLINDRICAL', 'SPHERICAL'):
+                coords = _local_coordinates_to_global(coords, system)
             radioss_coords = ''.join(f"{coord:>20.15g}" for coord in coords)
+            if extra:
+                radioss_coords += ''.join(f" {value}" for value in extra)
             node_lines[transform_id].append(f"{node_id:>10}{radioss_coords}")
 
     return node_lines
@@ -725,7 +865,8 @@ def create_nblocks(nsets):
             thnod_block += f"/TH/NODE/{nset_counter}\n"
             thnod_block += f"{display_name(nset_name)}\n"
             thnod_block += "#     var1      var2      var3      var4      var5      var6      var7      var8      var9     var10\n"
-            thnod_block += "DEF       REACX     REACY     REACZ\n"
+            variables = nset_data.get('output_variables') or ('DEF', 'REACX', 'REACY', 'REACZ')
+            thnod_block += _format_th_variables(variables)
             thnod_block += "#    NODid     Iskew                                           NODname\n"
             formatted_values = '\n'.join(f"{value:>10}" for value in nset_values)
             thnod_block += formatted_values + '\n'
@@ -5705,26 +5846,60 @@ def convert_discoup(input_lines, nsets, max_elem_id):
 ####################################################################################################
 # Mapping of Radioss animation (/ANIM) cards to the Abaqus field output
 # variables that they reproduce.  Cards marked with '*' are always written.
+# The card names follow the Radioss 2022/2025 Reference Guide (/ANIM/NODA,
+# /ANIM/VECT, /ANIM/Eltyp/Restype, /ANIM/BRICK/TENS, /ANIM/SHELL/TENS).
 ANIM_CARD_VARIABLES = {
     '/ANIM/VECT/DISP': {'U'},
     '/ANIM/VECT/VEL': {'V'},
     '/ANIM/VECT/ACC': {'A'},
-    '/ANIM/VECT/CONT': {'P', 'CONTACT'},
+    '/ANIM/VECT/FREAC': {'RF'},
+    '/ANIM/VECT/CONT': {'P', 'CONTACT', 'CFORCE'},
     '/ANIM/VECT/CONT2': {'P', 'CONTACT'},
-    '/ANIM/VECT/PCONT': {'P', 'CONTACT'},
+    '/ANIM/VECT/PCONT': {'P', 'CONTACT', 'CPRESS'},
+    '/ANIM/VECT/PCONT2': {'P', 'CONTACT', 'CPRESS'},
     '/ANIM/BRICK/TENS/STRESS': {'S', 'STRESS'},
-    '/ANIM/ELEM/EPSP': {'E', 'PE', 'EPSP'},
+    '/ANIM/BRICK/TENS/STRAIN': {'E', 'STRAIN'},
+    '/ANIM/BRICK/VONM': {'S', 'VONM'},
+    '/ANIM/BRICK/EPSP': {'PE', 'PEEQ', 'EPSP'},
+    '/ANIM/BRICK/EINT': {'ENER', 'EINT'},
+    '/ANIM/ELEM/EPSP': {'PE', 'PEEQ', 'EPSP'},
     '/ANIM/ELEM/ENER': {'ENER'},
     '/ANIM/ELEM/VONM': {'S', 'VONM'},
-    '/ANIM/SHELL/EPSP/UPPER': {'E', 'PE', 'EPSP'},
-    '/ANIM/SHELL/EPSP/LOWER': {'E', 'PE', 'EPSP'},
+    '/ANIM/ELEM/TEMP': {'TEMP', 'NT'},
+    '/ANIM/ELEM/DENS': {'DENS'},
+    '/ANIM/ELEM/OFF': {'STATUS'},
+    '/ANIM/ELEM/DAMG': {'DAMAGE', 'DMG'},
+    '/ANIM/SHELL/EPSP/UPPER': {'PE', 'PEEQ', 'EPSP'},
+    '/ANIM/SHELL/EPSP/LOWER': {'PE', 'PEEQ', 'EPSP'},
     '/ANIM/SHELL/TENS/STRESS/UPPER': {'S', 'STRESS'},
     '/ANIM/SHELL/TENS/STRESS/LOWER': {'S', 'STRESS'},
+    '/ANIM/SHELL/TENS/STRAIN/UPPER': {'E', 'STRAIN'},
+    '/ANIM/SHELL/TENS/STRAIN/LOWER': {'E', 'STRAIN'},
+    '/ANIM/SHELL/VONM': {'S', 'VONM'},
+    '/ANIM/SHELL/EINT': {'ENER', 'EINT'},
+    '/ANIM/NODA/TEMP': {'TEMP', 'NT'},
+    '/ANIM/NODA/P': {'P', 'PRESSURE'},
     '/ANIM/NODA/DT': {'*'},
     '/ANIM/NODA/DMAS': {'*'},
 }
 ANIM_CARD_ORDER = list(ANIM_CARD_VARIABLES)
 KNOWN_FIELD_VARIABLES = set().union(*ANIM_CARD_VARIABLES.values()) - {'*'}
+# Component variables in Abaqus (U1, RF2, S11, ...) select the same family
+# of Radioss animation output as the whole-field variable.
+FIELD_VARIABLE_ALIASES = {
+    'DISP': 'U', 'DISPLACEMENT': 'U', 'U1': 'U', 'U2': 'U', 'U3': 'U',
+    'VELO': 'V', 'VELOCITY': 'V', 'V1': 'V', 'V2': 'V', 'V3': 'V',
+    'ACCE': 'A', 'ACCELERATION': 'A', 'A1': 'A', 'A2': 'A', 'A3': 'A',
+    'REAC': 'RF', 'REACTION': 'RF', 'RF1': 'RF', 'RF2': 'RF', 'RF3': 'RF',
+    'S11': 'S', 'S12': 'S', 'S13': 'S', 'S22': 'S', 'S23': 'S', 'S33': 'S',
+    'E11': 'E', 'E12': 'E', 'E13': 'E', 'E22': 'E', 'E23': 'E', 'E33': 'E',
+    'PE11': 'PE', 'PE22': 'PE', 'PE33': 'PE', 'PEEQ': 'PE', 'PEMAG': 'PE',
+    'TEMP': 'TEMP', 'NT': 'TEMP', 'TEMPERATURE': 'TEMP',
+    'CPRESS': 'CPRESS', 'CFORCE': 'CFORCE', 'PRESS': 'P', 'PRESSURE': 'P',
+    'SENER': 'ENER', 'EINT': 'EINT',
+    'DENSITY': 'DENS', 'STATUS': 'STATUS', 'OFF': 'STATUS',
+    'DAMAGE': 'DAMAGE', 'DMG': 'DAMAGE',
+}
 
 OUTPUT_REQUEST_PATTERNS = {
     'field': r'^\s*\*OUTPUT\s*,\s*FIELD\b',
@@ -5734,8 +5909,86 @@ OUTPUT_REQUEST_PATTERNS = {
     'contact': r'^\s*\*CONTACT\s+(PRINT|FILE)\b',
 }
 
+# Radioss time-history (/TH) variables for the Abaqus output variables that
+# have a direct equivalent.  Groups such as DEF/D/STRESS are documented in
+# the Radioss Reference Guide, "Output Database" chapter.
+NODE_TH_VARIABLES = {
+    'U': ('D',), 'DISP': ('D',), 'U1': ('DX',), 'U2': ('DY',), 'U3': ('DZ',),
+    'V': ('V',), 'VEL': ('V',), 'V1': ('VX',), 'V2': ('VY',), 'V3': ('VZ',),
+    'A': ('A',), 'ACC': ('A',), 'A1': ('AX',), 'A2': ('AY',), 'A3': ('AZ',),
+    'RF': ('REACX', 'REACY', 'REACZ'), 'REAC': ('REACX', 'REACY', 'REACZ'),
+    'RF1': ('REACX',), 'RF2': ('REACY',), 'RF3': ('REACZ',),
+    'DR': ('DRX', 'DRY', 'DRZ'), 'DR1': ('DRX',), 'DR2': ('DRY',), 'DR3': ('DRZ',),
+    'TEMP': ('TEMP',), 'NT': ('TEMP',),
+    'X': ('XYZ',), 'COORD': ('XYZ',),
+}
+
+BRICK_TH_VARIABLES = {
+    'S': ('STRESS',), 'STRESS': ('STRESS',),
+    'S11': ('SX',), 'S22': ('SY',), 'S33': ('SZ',),
+    'S12': ('SXY',), 'S13': ('SXZ',), 'S23': ('SYZ',),
+    'E': ('STRAIN',), 'STRAIN': ('STRAIN',),
+    'E11': ('EPSXX',), 'E22': ('EPSYY',), 'E33': ('EPSZZ',),
+    'E12': ('EPSXY',), 'E13': ('EPSZX',), 'E23': ('EPSYZ',),
+    'PE': ('PLAS',), 'PEEQ': ('PLAS',), 'EPSP': ('PLAS',),
+    'TEMP': ('TEMP',), 'NT': ('TEMP',),
+    'IE': ('IE',), 'ENER': ('IE',), 'DENS': ('DENS',),
+    'STATUS': ('OFF',), 'OFF': ('OFF',),
+}
+
+SHELL_TH_VARIABLES = {
+    'S': ('STRESS',), 'STRESS': ('STRESS',),
+    'E': ('STRAIN',), 'STRAIN': ('STRAIN',),
+    'PE': ('PLAS',), 'PEEQ': ('PLAS',), 'EPSP': ('PLAS',),
+    # /TH/SHEL and /TH/SH3N have no TEMP variable; such requests are warned
+    # about and dropped rather than producing an invalid card.
+    'IE': ('IEM',), 'ENER': ('IEM',), 'STATUS': ('OFF',), 'OFF': ('OFF',),
+}
+
+# Valid /TH/INTER variables/groups from the Radioss Reference Guide and
+# hm_cfg_files/.../OUTPUTBLOCK/th_inter.cfg: DEF, FN, FT, |FN|, |F|,
+# FNX/FNY/FNZ, FTX/FTY/FTZ, MX/MY/MZ and the absolute-force components.
+INTERFACE_TH_VARIABLES = {
+    'CFORCE': ('FN', 'FT'), 'CSTRESS': ('FN',), 'P': ('FN',), 'CPRESS': ('FN',),
+    'CONTACT': ('DEF',), 'S': ('FN',), 'DEF': ('DEF',),
+    'FN': ('FN',), 'FT': ('FT',), '|FN|': ('|FN|',), '|F|': ('|F|',),
+    'FNX': ('FNX',), 'FNY': ('FNY',), 'FNZ': ('FNZ',),
+    'FTX': ('FTX',), 'FTY': ('FTY',), 'FTZ': ('FTZ',),
+    'FX': ('|F|',), 'FY': ('|F|',), 'FZ': ('|F|',),
+    'MX': ('MX',), 'MY': ('MY',), 'MZ': ('MZ',),
+    'OFRIC': ('OFRIC',),
+}
+INTERFACE_TH_DEFAULT = ('DEF',)
+
+
+def expand_field_variables(variables):
+    """Expand Abaqus field variable names to the animation families they use."""
+    expanded = set()
+    for variable in variables:
+        name = str(variable).strip().upper()
+        if not name:
+            continue
+        expanded.add(FIELD_VARIABLE_ALIASES.get(name, name))
+    return expanded
+
+
+def _output_parameters(line):
+    """Extract set/interface names from an Abaqus output request card."""
+    parameters = {}
+    for key, pattern in (
+        ('nset', r'\bNSET\s*=\s*("[^"]+"|[\w\-]+)'),
+        ('elset', r'\bELSET\s*=\s*("[^"]+"|[\w\-]+)'),
+        ('interaction', r'\bINTERACTION\s*=\s*("[^"]+"|[\w\-]+)'),
+        ('surface', r'\b(?:SLAVE|SURFACE)\s*=\s*("[^"]+"|[\w\-]+)'),
+    ):
+        match = re.search(pattern, line, re.IGNORECASE)
+        if match:
+            parameters[key] = match.group(1)
+    return parameters
+
+
 def collect_output_requests(input_lines):
-    """Collect .inp output requests so the engine deck can reflect them (P1/P3)."""
+    """Collect .inp output requests so the engine/starter decks reflect them."""
     requests = {category: [] for category in OUTPUT_REQUEST_PATTERNS}
     for index, raw_line in enumerate(input_lines):
         line = raw_line.strip()
@@ -5753,15 +6006,183 @@ def collect_output_requests(input_lines):
                and not input_lines[j].strip().startswith('*')):
             variables.extend([value.strip() for value in input_lines[j].split(',') if value.strip()])
             j += 1
-        requests[category].append({
+        request = {
             'variables': variables,
             'preselect': preselect,
             'line': index + 1,
             'raw': line,
-        })
+            'converted': False,
+        }
+        request.update(_output_parameters(line))
+        requests[category].append(request)
     return requests
 
-def parse_control_data(input_lines, simple_file_name):
+def _numeric_set_values(values):
+    """Return the numeric IDs of an Abaqus set, deduplicated and sorted."""
+    numeric = []
+    for value in values or []:
+        if isinstance(value, int):
+            numeric.append(value)
+        elif str(value).strip().isdigit():
+            numeric.append(int(str(value).strip()))
+    return sorted(set(numeric))
+
+
+def _format_th_variables(variables):
+    """Format /TH variable names (max. 10 per 10-column line)."""
+    lines = []
+    for i in range(0, len(variables), 10):
+        lines.append(''.join(f"{name:<10}" for name in variables[i:i + 10]) + '\n')
+    return ''.join(lines)
+
+
+def _th_variables_for(request, mapping, default, keyword=None):
+    """Map an Abaqus output variable list to Radioss /TH variables.
+
+    Variables without an equivalent for this /TH keyword are dropped with a
+    warning (e.g. TEMP for /TH/SHEL and /TH/SH3N).
+    """
+    if request.get('preselect') or not request.get('variables'):
+        return list(default)
+    variables = []
+    dropped = []
+    for name in request['variables']:
+        key = str(name).strip().upper()
+        mapped = mapping.get(key)
+        if not mapped:
+            if key:
+                dropped.append(str(name).strip())
+            continue
+        for variable in mapped:
+            if variable not in variables:
+                variables.append(variable)
+    if dropped and keyword:
+        warn(f"output variable(s) {', '.join(dropped)} have no {keyword} equivalent "
+             f"and are ignored (line {request.get('line')})")
+    return variables[:10]
+
+
+def _format_th_block(keyword, group_id, title, variables, ids, with_skew=False):
+    """Build one Radioss Starter time-history group."""
+    separator = "#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|\n"
+    block = separator + f"{keyword}/{group_id}\n" + f"{display_name(title)}\n"
+    block += _format_th_variables(variables)
+    if with_skew:
+        # /TH/SHEL and /TH/SH3N use one (elem_ID, skew_ID) pair per line.
+        for element_id in ids:
+            block += f"{element_id:>10}{0:>10}\n"
+    else:
+        for i in range(0, len(ids), 10):
+            block += ''.join(f"{value:>10}" for value in ids[i:i + 10]) + '\n'
+    return block
+
+
+def apply_node_output_requests(output_requests, nsets):
+    """Attach node history variables to NSETs for create_nblocks()."""
+    requests = list(output_requests.get('node', []))
+    requests.extend(request for request in output_requests.get('history', [])
+                    if request.get('nset'))
+    for request in requests:
+        nset_name = request.get('nset')
+        if not nset_name or nset_name not in nsets:
+            continue
+        variables = _th_variables_for(
+            request, NODE_TH_VARIABLES, ('DEF', 'REACX', 'REACY', 'REACZ'),
+            keyword='/TH/NODE',
+        )
+        nset_data = nsets[nset_name]
+        existing = tuple(nset_data.get('output_variables', ()))
+        if not variables:
+            # convert_nsets() may already have flagged the set as referenced
+            # for *NODE OUTPUT/PRINT.  Only clear that flag when no other
+            # request for this set produced mapped variables; otherwise an
+            # unmapped request would discard a valid earlier /TH/NODE group.
+            if not existing:
+                nset_data['is_referenced'] = False
+            continue
+        nset_data['is_referenced'] = True
+        nset_data['output_variables'] = tuple(dict.fromkeys(existing + tuple(variables)))
+        request['converted'] = True
+
+
+def _interface_ids_by_name(contacts):
+    """Map contact interface names to their /INTER identifiers."""
+    interfaces = {}
+    text = '\n'.join(str(block) for block in contacts or [])
+    for match in re.finditer(r'/INTER/[A-Z0-9/]+/(\d+)\s*\n\s*([^\n]+)', text, re.IGNORECASE):
+        interfaces[match.group(2).strip()] = match.group(1)
+    return interfaces
+
+
+def create_history_blocks(output_requests, elset_dicts=None, brick_list=None,
+                          shell_list=None, sh3n_list=None, contacts=None, first_id=1):
+    """Create Starter /TH/BRIC, /TH/SHEL, /TH/SH3N and /TH/INTER blocks.
+
+    Node requests are handled by :func:`apply_node_output_requests` and
+    :func:`create_nblocks`, which already emit /TH/NODE groups for NSETs.
+    Requests whose target set/interface or variables cannot be resolved are
+    left unconverted so the engine deck can call them out with a warning.
+    """
+    blocks = []
+    group_id = first_id
+    elset_dicts = elset_dicts or {}
+
+    element_requests = list(output_requests.get('element', []))
+    element_requests.extend(request for request in output_requests.get('history', [])
+                            if request.get('elset'))
+    categories = (
+        ('brick', brick_list, '/TH/BRIC', BRICK_TH_VARIABLES, ('STRESS', 'STRAIN', 'IE')),
+        ('shell', shell_list, '/TH/SHEL', SHELL_TH_VARIABLES, ('STRESS', 'STRAIN', 'IEM')),
+        ('sh3n', sh3n_list, '/TH/SH3N', SHELL_TH_VARIABLES, ('STRESS', 'STRAIN', 'IEM')),
+    )
+    for request in element_requests:
+        elset_name = request.get('elset')
+        if not elset_name:
+            continue
+        values = _numeric_set_values(elset_dicts.get(elset_name, []))
+        created = False
+        for category, element_ids, keyword, mapping, default in categories:
+            ids = [value for value in values if value in set(element_ids or [])]
+            if not ids:
+                continue
+            variables = _th_variables_for(request, mapping, default, keyword=keyword)
+            if not variables:
+                continue
+            blocks.append((_format_th_block(
+                keyword, group_id, f"{elset_name} {category} history",
+                variables, ids, with_skew=keyword in ('/TH/SHEL', '/TH/SH3N'),
+            ),))
+            group_id += 1
+            created = True
+        if created:
+            request['converted'] = True
+
+    interfaces = _interface_ids_by_name(contacts)
+    contact_requests = list(output_requests.get('contact', []))
+    contact_requests.extend(request for request in output_requests.get('history', [])
+                            if request.get('interaction') or request.get('surface'))
+    for request in contact_requests:
+        name = request.get('interaction') or request.get('surface')
+        interface_id = interfaces.get(name)
+        if not interface_id:
+            continue
+        variables = _th_variables_for(
+            request, INTERFACE_TH_VARIABLES, INTERFACE_TH_DEFAULT,
+            keyword='/TH/INTER',
+        )
+        if not variables:
+            continue
+        blocks.append((_format_th_block(
+            '/TH/INTER', group_id, f"{name} contact history",
+            variables, [int(interface_id)],
+        ),))
+        group_id += 1
+        request['converted'] = True
+
+    return blocks
+
+
+def parse_control_data(input_lines, simple_file_name, output_requests=None):
     engine_file = []
 
     dt_value = 5e-7               #
@@ -5771,7 +6192,8 @@ def parse_control_data(input_lines, simple_file_name):
     th_interval = 1e-4            #               If available
 
     dt_set = False                #    Tracks whether dt was set by a 'MASS SCALING' input
-    output_requests = collect_output_requests(input_lines)
+    if output_requests is None:
+        output_requests = collect_output_requests(input_lines)
 
     i = 0 # Initialize an index for iterating through input_lines
 
@@ -5909,7 +6331,7 @@ def parse_control_data(input_lines, simple_file_name):
         selected_cards = set()
         requested_variables = set()
         for request in field_requests:
-            variables = {variable.upper() for variable in request['variables']}
+            variables = expand_field_variables(request['variables'])
             requested_variables.update(variables)
             for name in sorted(variables - KNOWN_FIELD_VARIABLES):
                 warn(f"*OUTPUT, FIELD variable {name} (line {request['line']}) has no /ANIM equivalent and is ignored")
@@ -5923,13 +6345,17 @@ def parse_control_data(input_lines, simple_file_name):
     engine_file.append(f"0  {anim_interval}\n")
 
     anim_groups = [
-        ['/ANIM/VECT/DISP', '/ANIM/VECT/VEL', '/ANIM/VECT/ACC'],
-        ['/ANIM/VECT/CONT', '/ANIM/VECT/CONT2', '/ANIM/VECT/PCONT'],
-        ['/ANIM/BRICK/TENS/STRESS'],
-        ['/ANIM/ELEM/EPSP', '/ANIM/ELEM/ENER', '/ANIM/ELEM/VONM'],
+        ['/ANIM/VECT/DISP', '/ANIM/VECT/VEL', '/ANIM/VECT/ACC', '/ANIM/VECT/FREAC'],
+        ['/ANIM/VECT/CONT', '/ANIM/VECT/CONT2', '/ANIM/VECT/PCONT', '/ANIM/VECT/PCONT2'],
+        ['/ANIM/BRICK/TENS/STRESS', '/ANIM/BRICK/TENS/STRAIN', '/ANIM/BRICK/VONM',
+         '/ANIM/BRICK/EPSP', '/ANIM/BRICK/EINT'],
+        ['/ANIM/ELEM/EPSP', '/ANIM/ELEM/ENER', '/ANIM/ELEM/VONM', '/ANIM/ELEM/TEMP',
+         '/ANIM/ELEM/DENS', '/ANIM/ELEM/OFF', '/ANIM/ELEM/DAMG'],
         ['/ANIM/SHELL/EPSP/UPPER', '/ANIM/SHELL/EPSP/LOWER'],
-        ['/ANIM/NODA/DT', '/ANIM/NODA/DMAS'],
-        ['/ANIM/SHELL/TENS/STRESS/UPPER', '/ANIM/SHELL/TENS/STRESS/LOWER'],
+        ['/ANIM/SHELL/TENS/STRESS/UPPER', '/ANIM/SHELL/TENS/STRESS/LOWER',
+         '/ANIM/SHELL/TENS/STRAIN/UPPER', '/ANIM/SHELL/TENS/STRAIN/LOWER'],
+        ['/ANIM/SHELL/VONM', '/ANIM/SHELL/EINT'],
+        ['/ANIM/NODA/TEMP', '/ANIM/NODA/P', '/ANIM/NODA/DT', '/ANIM/NODA/DMAS'],
     ]
     for group in anim_groups:
         chosen = [card for card in group if card in selected_cards]
@@ -5950,10 +6376,14 @@ def parse_control_data(input_lines, simple_file_name):
     engine_file.append("/TFILE/4\n")
     engine_file.append(f"{th_interval}\n")
 
-    # P1/P3: history, node/element and contact print/file requests are kept as
-    # comments so they are visible in the engine deck, with explicit warnings.
+    # P3: requests that became Starter /TH groups are not repeated here;
+    # unconverted history/print/file requests stay visible as comments.
     for category in ('history', 'node', 'element', 'contact'):
-        requests = output_requests[category]
+        requests = [request for request in output_requests[category]
+                    if not request.get('converted', False)
+                    and not (category == 'history' and not request['variables']
+                             and not any(request.get(key) for key in
+                                         ('nset', 'elset', 'interaction', 'surface')))]
         if not requests:
             continue
         for request in requests:
@@ -6218,6 +6648,8 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     non_numeric_references, relsets_for_expansion_dict, nset_references
     ):
 
+    systems = collect_systems(input_lines)
+    output_requests = collect_output_requests(input_lines)
     transform_lines, transform_data = convert_transforms(input_lines)
     if run_timer:
         elapsed_time = time.time() - start_time
@@ -6228,7 +6660,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"Nodes Read:              {elapsed_time:8.3f} seconds")
 
-    node_lines = convert_nodes(node_data)
+    node_lines = convert_nodes(node_data, systems)
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Nodes Done:              {elapsed_time:8.3f} seconds")
@@ -6239,6 +6671,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         print(f"Dist Coups Prep Done:    {elapsed_time:8.3f} seconds")
 
     nsets, nset_counter, input_lines = convert_nsets(input_lines, nset_references)
+    apply_node_output_requests(output_requests, nsets)
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Nsets Read:              {elapsed_time:8.3f} seconds")
@@ -6380,7 +6813,12 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
         elapsed_time = time.time() - start_time
         print(f"DisCoups Done:           {elapsed_time:8.3f} seconds")
 
-    engine_file = parse_control_data(input_lines, simple_file_name)
+    history_blocks = create_history_blocks(
+        output_requests, elset_dicts, brick_list, shell_list, sh3n_list,
+        contacts, first_id=nset_counter + 1,
+    )
+    engine_file = parse_control_data(input_lines, simple_file_name,
+                                     output_requests=output_requests)
     if run_timer:
         elapsed_time = time.time() - start_time
         print(f"Engine File Done:        {elapsed_time:8.3f} seconds")
@@ -6389,6 +6827,7 @@ def main_conversion_sp(input_lines, simple_file_name, elsets_for_expansion_dict,
     # nset_blocks were built.  Rebuild them from the final nsets so those
     # groups are not silently dropped from the starter file.
     nset_blocks = create_nblocks(nsets)
+    nset_blocks.extend(history_blocks)
 
     return (
             transform_lines, transform_data, node_lines, nsets, nset_blocks, material_names,
@@ -7041,6 +7480,7 @@ def preprocess_lines(original_lines):
     input_lines = []
     elset_counter = 1  # Counter for generating placeholder elset names
     system_counter = 0
+    used_system_ids = set()
 
     for line in original_lines:
         if line.lower().startswith('*assembly'):
@@ -7053,16 +7493,39 @@ def preprocess_lines(original_lines):
             modified_line = sanitize_inp_line(line)
 
             if modified_line.lower().startswith('*system'):
-                system_counter += 1
-                # P1: keep original *SYSTEM parameters (TYPE, NSET, ...); only
-                # the ID is renumbered because inp2rad writes its own frames.
-                if re.search(r'\bID\s*=\s*[\w\-]+', modified_line, re.IGNORECASE):
-                    modified_line = re.sub(r'\bID\s*=\s*[\w\-]+', f'ID={system_counter}',
-                                           modified_line, count=1, flags=re.IGNORECASE)
+                # P3: numeric explicit IDs are preserved (after normalizing
+                # leading zeros) so /TRANSFORM and node group keys still
+                # match.  Non-numeric, duplicate and missing IDs get a free
+                # integer; /TRANSFORM requires a numeric identifier.
+                id_match = re.search(r'\bID\s*=\s*([\w\-]+)', modified_line, re.IGNORECASE)
+                if id_match:
+                    raw_id = id_match.group(1)
+                    system_id = _normalize_system_id(raw_id)
+                    reason = None
+                    if not system_id.isdigit():
+                        reason = f"non-numeric *SYSTEM ID={raw_id}"
+                    elif system_id in used_system_ids:
+                        reason = f"duplicate *SYSTEM ID={raw_id}"
+                    if reason:
+                        system_counter += 1
+                        while str(system_counter) in used_system_ids:
+                            system_counter += 1
+                        warn(f"{reason} was renumbered to {system_counter}")
+                        system_id = str(system_counter)
+                    if reason or system_id != raw_id:
+                        modified_line = re.sub(
+                            r'\bID\s*=\s*[\w\-]+', f'ID={system_id}', modified_line,
+                            count=1, flags=re.IGNORECASE,
+                        )
                 else:
-                    modified_line = modified_line.rstrip() + f', ID={system_counter}\n'
-                if system_counter > 1:
-                    warn("*SYSTEM definitions are renumbered sequentially; check /TRANSFORM IDs")
+                    system_counter += 1
+                    while str(system_counter) in used_system_ids:
+                        system_counter += 1
+                    system_id = str(system_counter)
+                    modified_line = modified_line.rstrip() + f', ID={system_id}\n'
+                used_system_ids.add(system_id)
+                if system_id.isdigit():
+                    system_counter = max(system_counter, int(system_id))
 
             # Check for lines starting with '*ELEMENT'
             if modified_line.lower().startswith('*element') and not modified_line.lower().startswith('*element output'):

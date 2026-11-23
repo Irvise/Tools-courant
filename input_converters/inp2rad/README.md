@@ -81,6 +81,8 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *CONTACT PROPERTY ASSIGNMENT
 
+*CONTACT PRINT / *CONTACT FILE (with INTERACTION -> /TH/INTER)
+
 *COUPLING, *DISTRIBUTING or *KINEMATIC
 
 *DAMAGE INITIATION, CRITERION = JOHNSON COOK
@@ -143,6 +145,8 @@ Supported keywords: (not all sub-options necessarily supported):
          
          C3D10M
 
+*ELEMENT PRINT / *ELEMENT FILE (with ELSET -> /TH/BRIC, /TH/SHEL or /TH/SH3N)
+
 *ELSET, ELSET (GENERATE supported)
 
 *FRICTION (with coefficient on next line)
@@ -169,7 +173,11 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *NODE
 
+*NODE PRINT / *NODE FILE (with NSET -> /TH/NODE)
+
 *NSET, NSET (GENERATE supported)
+
+*OUTPUT, FIELD / *OUTPUT, HISTORY (variable lists mapped to /ANIM and /TH cards)
 
 *PLASTIC
 
@@ -211,10 +219,17 @@ the warning that now accompanies it), is in
   internally (quotes removed, unsupported characters replaced with `_`) so all
   downstream `.inp` parsers agree on a single name; the original spelling is
   kept as the display name in Radioss part/set titles.
-* `*SYSTEM` cards are renumbered sequentially and become Radioss
-  `/TRANSFORM/POSITION` blocks.  `TYPE=`, `NSET=` and other parameters are
-  kept as comments; cylindrical/spherical systems are approximated by a fixed
-  frame at the reference point and a warning is printed.
+* `*SYSTEM` cards become Radioss `/TRANSFORM/POSITION` blocks.  Numeric
+  explicit `ID=` values are preserved (leading zeros normalized, e.g. `01` ->
+  `1`); non-numeric, duplicate or missing IDs are assigned a free integer with
+  a warning, so hand-written cards and TH groups keep referring to the same
+  system.  `TYPE=`, `NSET=` and other parameters are kept as comments.
+  Rectangular systems use a rigid frame for local node coordinates.  For
+  cylindrical systems `(r, theta, z)` uses `theta` in the local XY plane
+  from local X; for spherical systems `(r, theta, phi)` uses `theta` as that
+  azimuth and `phi` as the polar angle from local Z.  Those coordinates are
+  converted to global XYZ and an identity frame is written (a warning is
+  printed).
 * `*ELSET`/`*NSET` with `GENERATE` are expanded.  A GENERATE card with no
   numeric range is warned about instead of raising `IndexError`.
 * `*ASSEMBLY` (part/instance) decks are rejected with a catchable error; use a
@@ -233,17 +248,30 @@ the warning that now accompanies it), is in
   written.  `/TH/TITLE` now includes a title line.
 * `*DYNAMIC, EXPLICIT` and `*OUTPUT, FIELD` control run time, animation
   interval and `/TFILE` sampling.  With an explicit field variable list only
-  the corresponding `/ANIM` cards are emitted (e.g. `U` -> `/ANIM/VECT/DISP`);
-  `VARIABLE=PRESELECT` keeps the full default set.
+  the corresponding `/ANIM` cards are emitted; `VARIABLE=PRESELECT` (or no
+  list) keeps the full default set.  The mapping covers displacement,
+  velocity, acceleration, reaction force, stress/strain (brick and shell),
+  plastic strain, von Mises stress, temperature, density, energy, contact
+  force/pressure, damage and element status, including component names such
+  as `U1` and `S11`.  Unknown variables are warned about.
 * `*OUTPUT, HISTORY, TIME INTERVAL=` updates the time-history sampling.
-  History, node/element and contact print/file requests are recorded as
-  comments in the engine deck and produce an explicit warning; no `/TH` or
-  print/file cards are generated for them today.
+  `*NODE PRINT/FILE` and node history requests with an `NSET` generate
+  `/TH/NODE` groups; `*ELEMENT PRINT/FILE` and element history requests with
+  an `ELSET` generate `/TH/BRIC`, `/TH/SHEL` or `/TH/SH3N` groups; contact
+  requests whose `INTERACTION=` name matches a generated interface generate
+  `/TH/INTER` groups.  These cards are written to the starter deck.  Requests
+  with an unresolvable set/interface or variable remain comments in the
+  engine deck and produce a warning; variables that have no equivalent for a
+  given group (for example `TEMP` on `/TH/SHEL`/`/TH/SH3N`) are dropped with a
+  warning.  Contact groups use valid Radioss variables/groups
+  (`DEF`, `FN`, `FT`, `|FN|`, `|F|`, `FNX/Y/Z`, `FTX/Y/Z`, `MX/Y/Z`).
 
 ### Testing status
 
-Automated coverage in this branch is limited to element tests plus the new
-I/O/preprocessing/output tests in [tests/](tests/).  All other conversion
-paths are untested; broader coverage is being added by the P2 lane in a
-separate branch.  Warnings are the primary safety net until that coverage
-lands, so review the conversion log before running a generated deck.
+Automated coverage in this branch consists of the fast I/O/preprocessing/
+output tests in [tests/](tests/) (no solver needed), including field variable
+mapping, TH-card generation, curved `*SYSTEM` coordinate conversion and
+end-to-end starter/engine checks.  All other conversion paths are untested;
+broader coverage is being added by the P2 lane in a separate branch.  Warnings
+remain the primary safety net, so review the conversion log before running a
+generated deck.

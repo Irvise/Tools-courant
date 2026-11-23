@@ -21,9 +21,9 @@ Legend:
 | Quoted names (`ELSET="part (left)"`) | Supported | Names are normalized internally by `sanitize_inp_line` (quotes removed, `()@\`` replaced with `_`) because the downstream `.inp` readers use restricted character classes.  The original spelling is stored in `display_names` and used in Radioss part/set titles, so `part (left)` appears in the output deck as `part (left)` while internal keys use `part _left_`. |
 | `*INCLUDE, INPUT=file` | Supported | File contents merged into one deck. Recursive/quoted includes supported (nesting limited to 20); cycles skipped with warning. |
 | `*INCLUDE` with missing file | Supported with warning | Card replaced by `** inp2rad: missing INCLUDE ... - contents ignored`; no literal `*INCLUDE` is left for later stages to ignore silently. |
-| `*SYSTEM, ID=n` | Supported | `/TRANSFORM/POSITION/n`; nodes grouped under that transform, `//SUBMODEL` / `//ENDSUB` around the node block. |
-| `*SYSTEM, TYPE=CYLINDRICAL|SPHERICAL` | Supported (approximation) | Converted to a fixed `/TRANSFORM/POSITION` frame at the reference point; local directions away from that point are not reproduced. Warning printed. |
-| `*SYSTEM` other parameters (`NSET=`, ...) | Preserved as metadata | Kept in a `# TYPE=... NSET=...` comment in the transform block; IDs are renumbered sequentially. |
+| `*SYSTEM, ID=n` | Supported | `/TRANSFORM/POSITION/n`; nodes grouped under that transform, `//SUBMODEL` / `//ENDSUB` around the node block. Numeric explicit IDs are preserved (leading zeros normalized: `01` -> `1`); non-numeric, duplicate or missing IDs get a free number with a warning. |
+| `*SYSTEM, TYPE=CYLINDRICAL|SPHERICAL` | Supported (coordinate conversion) | Cylindrical `(r, theta, z)` with `theta` the azimuth in the local XY plane from local X; spherical `(r, theta, phi)` with `theta` the same azimuth and `phi` the polar angle from local Z (degrees). Coordinates are converted to global XYZ using the system origin, axis and X reference; an identity `/TRANSFORM/POSITION` frame is written. Warning printed. Curved direction fields (BCs, orthotropy, output skew projection) are not reproduced. |
+| `*SYSTEM` other parameters (`NSET=`, ...) | Preserved as metadata | Kept in a `# TYPE=... NSET=...` comment in the transform block. |
 | `*SYSTEM` with no coordinate data | Supported with warning | No `/TRANSFORM` written. |
 | `*ELSET, ELSET=..., GENERATE` / `*NSET ... GENERATE` | Supported | Expanded to explicit ID lists; missing or non-numeric ranges are warned about and skipped. |
 | Circular/nested `*ELSET` references | Supported with warning | Cycle ignored by `resolve_elset` (no recursion error); remaining numeric members are kept. |
@@ -40,24 +40,32 @@ Legend:
 | `*VARIABLE MASS SCALING, DT=` / `*FIXED MASS SCALING, DT=` | Supported | Overrides the initial time step. |
 | `*OUTPUT, FIELD, NUMBER INTERVAL=n` | Supported | Sets `/ANIM/DT` interval and `/TFILE` sampling from `run_time / n`; non-positive `n` is warned about. |
 | `*OUTPUT, FIELD, TIME INTERVAL=t` | Supported | Sets `/ANIM/DT` and `/TFILE` intervals. |
-| `*OUTPUT, FIELD, VARIABLE=<list>` | Supported | Only `/ANIM` cards matching the requested variables are emitted: `U` -> DISP, `V` -> VEL, `A` -> ACC, `S`/`VONM` -> stress/VONM, `E`/`PE` -> EPSP (solid+shell), `ENER` -> ENER, `P`/`CONTACT` -> contact vectors. Core `/ANIM/NODA/DT` and `/ANIM/NODA/DMAS` are always written. |
+| `*OUTPUT, FIELD, VARIABLE=<list>` | Supported | Only `/ANIM` cards matching the requested variables are emitted. Mappings: `U` (`U1..3`, `DISP`) -> `/ANIM/VECT/DISP`; `V`, `A` -> VEL/ACC; `RF` (`RF1..3`) -> `/ANIM/VECT/FREAC`; `S` (`S11..33`, `VONM`) -> brick/shell stress and VONM; `E` (`E11..33`) -> brick/shell strain; `PE`/`PEEQ` -> brick/shell plastic strain; `TEMP` -> nodal + element temperature; `ENER` -> element/brick/shell energy; `DENS`, `STATUS`, `DAMAGE` -> element data; `P`/`CONTACT`/`CPRESS`/`CFORCE` -> contact vectors/pressure. Core `/ANIM/NODA/DT` and `/ANIM/NODA/DMAS` are always written. |
 | `*OUTPUT, FIELD, VARIABLE=PRESELECT` (or no variable list) | Supported | Full default `/ANIM` set is written. |
-| Unknown field output variable | Feasible, not implemented | Listed in a warning; no matching card is emitted. |
-| `*OUTPUT, HISTORY, TIME INTERVAL=n` / `NUMBER INTERVAL=n` | Supported (partial) | Updates `/TFILE` sampling interval only. |
-| `*OUTPUT, HISTORY` variables | Feasible, not implemented | Recorded as comments in the engine file and warned about; no `/TH/...` cards generated. |
-| `*NODE PRINT`, `*ELEMENT PRINT`, `*CONTACT PRINT` (and `FILE` variants) | Feasible, not implemented | Recorded as comments and warned about; no print/file cards generated. |
+| Unknown field output variable | Supported with warning | Listed in a warning; no matching card is emitted. |
+| `*OUTPUT, HISTORY, TIME INTERVAL=n` / `NUMBER INTERVAL=n` | Supported | Updates `/TFILE` sampling interval. A bare interval-only request is not warned about. |
+| `*OUTPUT, HISTORY`, `NSET=` / `*NODE PRINT|FILE, NSET=` | Supported | Starter `/TH/NODE` group with variables mapped from the request (`U` -> `D`, `V` -> `V`, `A` -> `A`, `RF` -> `REACX/Y/Z`, `TEMP` -> `TEMP`, coordinates -> `XYZ`); legacy default `DEF REACX REACY REACZ` when no variables are listed. |
+| `*OUTPUT, HISTORY`, `ELSET=` / `*ELEMENT PRINT|FILE, ELSET=` | Supported | Starter `/TH/BRIC` (solids), `/TH/SHEL` (quads) or `/TH/SH3N` (trias) groups; variables mapped to BRIC/SHEL groups (`S` -> STRESS, `E` -> STRAIN, `PE`/`PEEQ` -> PLAS, `IE`/`ENER` -> IE/IEM, `STATUS` -> OFF, brick `E13` -> EPSZX). `TEMP` is valid for `/TH/BRIC` only; for shells it is dropped with a warning. |
+| `*CONTACT PRINT|FILE` / history requests with `INTERACTION=` | Supported when interface name is known | Starter `/TH/INTER` group mapped to the generated `/INTER/...` ID. Valid Radioss variables/groups are used: `CFORCE`/`CSTRESS`/`P` -> `FN`, `FT`; `FX/FY/FZ` -> `|F|`; explicit `FNX/Y/Z`, `FTX/Y/Z`, `MX/Y/Z`, `|FN|`, `|F|`, `OFRIC`; default `DEF`. Unmatched names remain commented and warned. |
+| Requests with an unknown set/interface or unmapped variables | Supported with warning | Kept as comments in the engine file with an explicit warning; no `/TH` group is generated. |
 | `/TH/TITLE` | Supported | Always followed by a title line (`Time history for <name>`). |
 | Output file naming | Supported | `<prefix>_0000.rad` (starter) and `<prefix>_0001.rad` (engine). `output_dir`/`output_prefix` can be supplied by library/GUI callers. |
+
+Note: the Radioss Starter keyword for solid-element time histories is
+`/TH/BRIC` (the Reference Guide and OpenRadioss starter reader use `BRIC`;
+`BRICK` is only an informal name).  All `/TH/...` groups are written to the
+**starter** deck; the engine deck keeps run control and `/ANIM` cards.
 | Radioss version selection | Supported | `radversion` (2023/2025) set via `radv` argument or command-line `--radv`; GUI parameter propagation fixed. |
 
 ## 3. Feasible, not implemented (I/O scope)
 
-* Generating `/TH/...` time-history cards from `*OUTPUT, HISTORY` and node/element
-  sets (today only the sampling interval is translated, requests are commented).
-* Generating Radioss print/file cards from `*NODE PRINT`, `*ELEMENT PRINT` and
-  `*CONTACT PRINT`.
-* Exact projection of cylindrical/spherical `*SYSTEM` directions onto a Radioss
-  transform for nodes far from the system reference point.
+* Exact projection of cylindrical/spherical `*SYSTEM` directions for boundary
+  conditions, orthotropic material axes and TH output skews.  Node positions
+  are converted, but the Radioss frame is still Cartesian.
+* Generating `/TH` groups for history requests whose target set/interface is
+  not defined in the deck (they remain commented and warned).
+* Generating print/file cards for request types outside the mapping in
+  section 2 (for example `*CONTACT PRINT` with an unrecognised interaction).
 * Direct support for `*ASSEMBLY` part-instance decks without flattening.
 * Arbitrary output-variable aliases beyond the mapping in section 2.
 
@@ -65,11 +73,15 @@ Legend:
 
 * Part/instance hierarchies: the generated flat starter has no instance
   concept; the input must be flattened.
-* Non-rectangular system frames: Radioss `/TRANSFORM/POSITION` is a fixed
-  Cartesian frame, so a spherical system cannot be reproduced exactly — the
-  converter emits the best-fit frame at the reference point and warns.
-* Abaqus history/contact print requests have no automatic equivalent in the
-  generated engine deck; they are preserved as comments only.
+* Curved system *directions*: Radioss `/TRANSFORM/POSITION` is a fixed
+  Cartesian frame, so a spherical/cylindrical system cannot be reproduced
+  exactly for directional data; node coordinates are converted to global XYZ
+  and an identity frame is emitted, with a warning.
+* Abaqus contact print requests whose interface cannot be matched by name are
+  preserved as comments only; Radioss `/TH/INTER` needs a concrete interface ID.
+* Nodal temperature time histories for shell elements: `/TH/SHEL` and
+  `/TH/SH3N` have no `TEMP` variable, so such request variables are dropped
+  with a warning (solid `/TH/BRIC` still supports `TEMP`).
 
 ## 5. Explicit "silently ignored" list (now warned)
 
@@ -81,8 +93,12 @@ engine file):
 2. Recursive `*INCLUDE` cycles and includes nested deeper than 20 levels.
 3. `*OUTPUT, FIELD` variables with no `/ANIM` equivalent.
 4. `*OUTPUT, HISTORY`, `*NODE PRINT`, `*ELEMENT PRINT`, `*CONTACT PRINT` /
-   `FILE` requests (only sampled interval/ comments are produced).
-5. Non-rectangular `*SYSTEM` approximation and unrecognised `TYPE=` values.
+   `FILE` requests whose target or variables cannot be mapped (mapped ones
+   now produce real starter `/TH` groups).
+5. Non-rectangular `*SYSTEM` coordinate conversion and unrecognised `TYPE=`
+   values; duplicate or non-numeric explicit system IDs are renumbered with a
+   warning (leading zeros are normalized silently).  TH variables without an
+   equivalent for their group (e.g. shell `TEMP`) are dropped with a warning.
 6. `*SYSTEM` cards without coordinate data or with an unsupported range line.
 7. `*ELSET`/`*NSET GENERATE` cards without a numeric start/end/step.
 8. Circular `*ELSET` references.
@@ -93,8 +109,11 @@ engine file):
 
 ## 6. Test coverage
 
-At the time of writing, automated coverage consists of the element tests plus
-the fast I/O/preprocessing/output tests under `tests/` (no solver required).
-All other conversion paths remain untested; the P2 lane is adding broader
-coverage in a separate branch.  Treat converter warnings as the primary safety
-net and review the generated starter/engine decks before running them.
+Automated coverage consists of the fast I/O/preprocessing/output tests under
+`tests/` (no solver required).  They cover includes, preprocessing, system ID
+preservation and curved node conversion, field variable -> `/ANIM` mapping,
+`/TH` group generation for node/element/contact requests, and an end-to-end
+starter/engine write.  All other conversion paths remain untested; the P2 lane
+is adding broader coverage in a separate branch.  Treat converter warnings as
+the primary safety net and review the generated starter/engine decks before
+running them.
