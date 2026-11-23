@@ -27,6 +27,15 @@ OpenCourant GUI is a graphical launcher for OpenCourant
 
 * [inp2rad](https://github.com/OpenCourant/Tools/tree/main/input_converters/inp2rad) : converts .inp format to Radioss (.rad) format.
 
+  Contact/tie/constraint mappings and their limitations are documented in
+  [`docs/SUPPORT.md`](docs/SUPPORT.md).  In particular, Radioss
+  `/INTER/TYPE24` has no true rough/no-slip flag, so `*FRICTION, ROUGH` is
+  converted to a documented high-Coulomb approximation with an explicit
+  warning; rate/temperature-dependent friction and cohesive contact are
+  warned and dropped rather than silently mismapped.  The test suite includes
+  fast unit tests plus starter-gated validation of degraded-shell, 2-D and
+  beam contact surfaces (skip automatically when the solver is unavailable).
+
 ## Output converter
 
 * anim_to_csv : converts OpenCourant animation files to csv format.

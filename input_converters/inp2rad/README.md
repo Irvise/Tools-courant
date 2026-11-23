@@ -147,11 +147,15 @@ Supported keywords: (not all sub-options necessarily supported):
          
          C3D10M
 
+         S6, S6R, S8, S8R (written as degraded /SH3N and /SHELL; corner-node contact faces)
+
+         S2, S2R, B31, B32, B33 (segment faces only; two-node faces are withheld from 3-D contact with a warning)
+
 *ELSET, ELSET (GENERATE supported)
 
 *FRICTION (with coefficient on next line)
 
-*FRICTION, ROUGH
+*FRICTION, ROUGH (no true no-slip flag exists in Radioss /INTER/TYPE24; converted to a warned, documented high-Coulomb approximation with Ifric=0)
 
 *HYPERELASTIC (MOONEY-RIVLIN, OGDEN, NEO HOOKE, POLYNOMIAL, REDUCED POLYNOMIAL and MARLOW (only with *UNIAXIAL TEST DATA version) forms only)
 
@@ -187,7 +191,7 @@ Supported keywords: (not all sub-options necessarily supported):
 
 *SURFACE, TYPE=ELEMENT or TYPE=NODE (numeric shell faces 1/2 -> spos/sneg and solid faces 1..6 -> s1..s6; degraded S6/S8 shells and 2-D/beam elements are supported; TYPE=NODE surfaces are represented by their node group and cannot be used as contact/pressure surfaces)
 
-*SURFACE INTERACTION (constant coefficient or ROUGH; rate/temperature-dependent friction and cohesive behaviour are warned and dropped)
+*SURFACE INTERACTION (constant coefficient or warned ROUGH approximation; rate/temperature-dependent friction and cohesive behaviour are warned and dropped; see docs/SUPPORT.md)
 
 *SURFACE INTERACTION, NAME=RADIOSS_GENERAL (special usecase to ease PrePoMax usage, existence of this will result in a global general contact)
 
@@ -204,3 +208,14 @@ Supported keywords: (not all sub-options necessarily supported):
 For the detailed mapping of contact, tie, coupling, rigid-body and MPC
 keywords — including known limitations and the warnings emitted for dropped
 settings — see [docs/SUPPORT.md](../../docs/SUPPORT.md).
+
+## Tests
+
+```
+python3 -m unittest discover -s tests
+```
+
+Fast unit tests need no solver.  `tests/test_solver_surfaces.py` additionally
+runs converted decks through the built OpenCourant starter to validate
+contact surfaces; it skips when the starter is unavailable (override with
+`INP2RAD_STARTER` / `OPENCOURANT_PATH`).

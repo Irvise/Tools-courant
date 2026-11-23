@@ -43,6 +43,16 @@ radversion = 2025 #2023: for compatibility with HM 2025 and Radioss <2024
 
 debug_mode = False # enables writing of commments and intermediate files for debugging
 
+# Abaqus' *FRICTION, ROUGH is a true no-slip (infinite mu) condition.  The
+# Radioss /INTER/TYPE24 and /FRICTION friction formulation flag (Ifric) only
+# offers Coulomb (0), generalized viscous (1), (modified) Darmstad (2),
+# Renard (3) and exponential decay (4): there is NO rough/no-slip flag.  Keep
+# ROUGH interactions distinct from numeric coefficients so the interface
+# writer can emit a documented, explicit high-Coulomb approximation and a
+# warning instead of silently writing the arbitrary value mu=1.0.
+ROUGH_FRICTION_MARKER = "__ROUGH__"
+ROUGH_FRICTION_COEFF = 1.0e6
+
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
 # Functions to convert aspects of the .inp Model
 #---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|
@@ -2889,7 +2899,12 @@ def process_element_block(current_element_block, current_element_type, max_elem_
         'MASS': 1, 'DCOUP3D': 1, 'CONN3D2': 2, 'SPRINGA': 2, 'S3': 3, 'S3R': 3, 'M3D3': 3,
         'R3D3': 3, 'S4': 4, 'S4R': 4, 'R3D4': 4, 'M3D4R': 4, 'C3D4': 4,
         'C3D6': 6, 'COH3D6': 6, 'SC6R': 6, 'SC8R': 8, 'C3D8': 8,
-        'C3D8I': 8, 'COH3D8': 8,'C3D8R': 8, 'C3D10': 10, 'C3D10M': 10
+        'C3D8I': 8, 'COH3D8': 8,'C3D8R': 8, 'C3D10': 10, 'C3D10M': 10,
+        # Degraded (mid-side node) shells and line/beam elements used by
+        # element surfaces.  convert_segments() already knows their two
+        # faces; the parser must keep the elements so surfaces are not empty.
+        'S6': 6, 'S6R': 6, 'S8': 8, 'S8R': 8,
+        'S2': 2, 'S2R': 2, 'B31': 2, 'B32': 3, 'B33': 2,
     }
 
     num_nodes = element_type_nodes.get(current_element_type.upper(), 0)
@@ -3065,6 +3080,53 @@ def convert_elements(non_numeric_references, elset_dicts, element_dicts, propert
                     if elset in elset_dicts:
                         elset_dict = elset_dicts[elset]
                         elset_dict.append(element_id)
+
+            elif (element_type.lower() in ("s6", "s6r")):
+                # Radioss has no 6-node shell: degrade to a 3-node SH3N using
+                # the corner nodes.  Mid-side nodes are not part of the face.
+                element_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+                element_lines.append(f"# Degraded S6 Shell Elements for PART: {part_name}, PID: {part_id}")
+                element_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+                element_lines.append(f"/SH3N/{part_id}")
+                for element in sorted(element_dict["elements"], key=lambda e: int(e.get('element_id', 0))):
+                    element_id = element.get('element_id', '')
+                    sh3n_list.append(element_id)
+                    nodes = ', '.join(element.get('nodes', []))
+                    nodes = nodes.split(', ')
+                    formatted_nodes = ''.join([value.rjust(10) for value in nodes[:3]])
+                    element_lines.append(f"{element_id:>10}{formatted_nodes}")
+                    if elset in elset_dicts:
+                        elset_dicts[elset].append(element_id)
+
+            elif (element_type.lower() in ("s8", "s8r")):
+                # Radioss has no 8-node shell: degrade to a 4-node SHELL using
+                # the corner nodes.  Mid-side nodes are not part of the face.
+                element_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+                element_lines.append(f"# Degraded S8 Shell Elements for PART: {part_name}, PID: {part_id}")
+                element_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
+                element_lines.append(f"/SHELL/{part_id}")
+                for element in sorted(element_dict["elements"], key=lambda e: int(e.get('element_id', 0))):
+                    element_id = element.get('element_id', '')
+                    shell_list.append(element_id)
+                    nodes = ', '.join(element.get('nodes', []))
+                    nodes = nodes.split(', ')
+                    formatted_nodes = ''.join([value.rjust(10) for value in nodes[:4]])
+                    element_lines.append(f"{element_id:>10}{formatted_nodes}")
+                    if elset in elset_dicts:
+                        elset_dicts[elset].append(element_id)
+
+            elif (element_type.lower() in ("s2", "s2r", "b31", "b32", "b33")):
+                # These elements are parsed so convert_segments() can build
+                # their two-sided faces, but they are NOT emitted as Radioss
+                # structural elements: /BEAM needs a beam property that
+                # inp2rad cannot derive from the .inp deck, and 2-node
+                # segments are not valid 3-D /SURF/SEG contact surfaces.
+                # Emitting an incomplete /BEAM block makes the starter abort.
+                print("### WARNING ###: line/beam elements "
+                      f"({element_type}) are not written as Radioss elements; "
+                      "only their segment faces are known and 2-node faces "
+                      "are withheld from 3-D contact surfaces.  Add beams / "
+                      "beam properties manually if they are structural.")
 
             elif element_type.lower() == "c3d4":
                 element_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
@@ -3633,6 +3695,17 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
     surf_already_processed = False
     allsurf = False
     prop_lines = []
+    # A 3-D /SURF/SEG needs 3 or 4 nodes per segment.  Two-sided line/beam
+    # segments (S2/S2R/B31/B32/B33) only have two nodes and make the starter
+    # read missing nodes as id 0, which aborts the run.  Count them across the
+    # WHOLE surface and defer the emit/withhold decision to finish_surface():
+    # deciding per data line would withhold a surface whose first face is a
+    # 2-node beam even when a later line holds a valid shell face, and would
+    # leave that later segment as an orphan (no /SURF/SEG header).
+    valid_segments = 0
+    short_segments = 0
+    surf_holder = []
+    surface_lines_start = 0
 
     def segment_for_target(target):
         """Return a representative segment dict for a surface entry."""
@@ -3654,6 +3727,54 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
         seg = segment_for_target(target)
         return bool(seg and 'spos' in seg)
 
+    def append_segment(nodes):
+        """Append a 3-D valid segment; count and drop 2-node line/beam faces."""
+        nonlocal valid_segments, short_segments
+        if not nodes:
+            return
+        if len(nodes) < 3:
+            short_segments += 1
+            return
+        segment_nodes = ''.join([f"{node:>10}" for node in nodes])
+        surf_holder.append(f"          {segment_nodes}")
+        valid_segments += 1
+
+    def finish_surface():
+        """Emit or withhold the active surface once all its lines are seen.
+
+        Called on every surface-block boundary (next *SURFACE, any other
+        keyword, or end of input).  This keeps a valid surface whose first
+        data line is a 2-node face, and warns only once per surface about
+        the omitted line/beam segments.
+        """
+        nonlocal valid_segments, short_segments, surf_holder
+        nonlocal surface_lines_start
+        if not current_surface_name:
+            return
+        if short_segments:
+            print("### WARNING ###: surface "
+                  f"'{current_surface_name}' has {short_segments} two-node "
+                  "line/beam segment(s). They are omitted: a 3-D "
+                  "/SURF/SEG requires 3 or 4 nodes and the starter aborts "
+                  "on 2-node faces. Use a shell/brick surface or a "
+                  "2-D/Type11 interface for beam contact.")
+        if valid_segments:
+            surface_lines.extend(surf_holder)
+        elif short_segments:
+            # No usable 3-D segments despite declared faces: drop the whole
+            # surface so contact/tie lookups skip it with a warning instead
+            # of emitting an interface with an empty/invalid surface.
+            print("### WARNING ###: surface "
+                  f"'{current_surface_name}' has no valid 3-D segments "
+                  "and is withheld from contact/tie lookups.")
+            surf_name_to_id.pop(current_surface_name, None)
+            nsets.pop(f"{current_surface_name}___nodes", None)
+            del surface_lines[surface_lines_start:]
+        valid_segments = 0
+        short_segments = 0
+        surf_holder = []
+        surface_lines_start = len(surface_lines)
+
     remaining_lines = []
 
     for line in input_lines:
@@ -3663,6 +3784,7 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
         matchnode = re.search(ntype_pattern, line, re.IGNORECASE)
 
         if matchnode:
+            finish_surface()  # a node surface ends any active element surface
             current_surface_name = None
             surf_already_processed = False
             # Extract surface name from the current line
@@ -3673,8 +3795,13 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
             continue
 
         if matchelement:
+            finish_surface()  # finalise the previous surface before starting a new one
             current_node_surface_name = None
             surf_already_processed = False
+            valid_segments = 0
+            short_segments = 0
+            surf_holder = []
+            surface_lines_start = len(surface_lines)
             # Extract surface name from the current line
             surface_name_match = re.search(r'\bNAME\s*=\s*([^,]+)', line, re.IGNORECASE)
             surface_name = surface_name_match.group(1).strip()#.lower()
@@ -3804,13 +3931,13 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                 surface_lines.append("#---1----|----2----|----3----|----4----|----5----|----6----|----7----|----8----|----9----|---10----|")
                 surface_lines.append(f"/SURF/SEG/{surf_id}\n{surface_name}")
                 surf_already_processed = True
-            surf_holder = []
 
             if surface_el is not None:
                 if surface_el in segment_dictionary:
-                    nodes = segment_dictionary[surface_el].get(surface_side, [])
-                    segment_nodes = ''.join([f"{node:>10}" for node in nodes])
-                    surf_holder.append(f"          {segment_nodes}")
+                    # 2-node line/beam faces are dropped by append_segment:
+                    # a 3-D /SURF/SEG reads 4 node ids and fails with
+                    # "undefined node 0" / "null area" errors.
+                    append_segment(segment_dictionary[surface_el].get(surface_side, []))
 
             if surface_el_byname is not None and allsurf is False and surface_side:
                 for elset_name, surface_els in elset_dicts.items():
@@ -3831,22 +3958,14 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                                         # Iterate over all possible surface sides and create a separate line for each side
                                         surface_sides = ['s1', 's2', 's3', 's4', 's5', 's6', 'spos', 'sneg']
                                         for surf_iter in surface_sides:
-                                            nodes = segment_dictionary[surface_el].get(surf_iter, [])
-                                            if nodes:  # Check if nodes exist (i.e., not an empty list)
-                                                segment_nodes = ''.join([f"{node:>10}" for node in nodes])
-                                                surf_holder.append(f"          {segment_nodes}")
+                                            append_segment(segment_dictionary[surface_el].get(surf_iter, []))
                                     else:
-                                        nodes = segment_dictionary[surface_el].get(surface_side, [])
-                                        segment_nodes = ''.join([f"{node:>10}" for node in nodes])
-                                        surf_holder.append(f"          {segment_nodes}")
+                                        append_segment(segment_dictionary[surface_el].get(surface_side, []))
                                 else:
                                 # Iterate over all possible surface sides and create a separate line for each side
                                     surface_sides = ['s1', 's2', 's3', 's4', 's5', 's6', 'spos', 'sneg']
                                     for surf_iter in surface_sides:
-                                        nodes = segment_dictionary[surface_el].get(surf_iter, [])
-                                        if nodes:  # Check if nodes exist (i.e., not an empty list)
-                                            segment_nodes = ''.join([f"{node:>10}" for node in nodes])
-                                            surf_holder.append(f"          {segment_nodes}")
+                                        append_segment(segment_dictionary[surface_el].get(surf_iter, []))
                             except (KeyError, TypeError, ValueError) as e:
                                 print(f"### WARNING ###: Error processing surface element {surface_el} in surface '{surface_el_byname}': {e}. Skipping this element.")
                                 continue
@@ -3889,13 +4008,17 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
                 prop_lines = []
                 allsurf = False
 
-            surface_lines.extend(surf_holder)
+            # Emit/withhold decisions and the short-segment warning are
+            # deferred to finish_surface() so a 2-node face on this line
+            # cannot discard a valid face on a later line of the same
+            # *SURFACE, and multi-line surfaces warn only once.
             surface_side = None
             surface_el = None
             surface_el_byname = None
             continue
 
         if current_surface_name and line.startswith('*'):
+            finish_surface()  # end of this surface block (another keyword)
             remaining_lines.append(line)
             current_surface_name = None
             surf_already_processed = False
@@ -3903,6 +4026,7 @@ def parse_surface_data(input_lines, elset_dicts, nset_counter, nsets,
         else:
             remaining_lines.append(line)  # Collect the remaining lines
 
+    finish_surface()  # last surface block (no trailing keyword)
     return surface_lines, surf_id, surf_name_to_id, nset_counter, nsets, elset_dicts, input_lines
 
 
@@ -3927,8 +4051,9 @@ def parse_surface_interaction_data(input_lines):
             # Check for '*FRICTION, ROUGH' pattern
             rough_pattern = r'^\s*\*FRICTION\s*,\s*ROUGH\s*$'
             if re.search(rough_pattern, line, re.IGNORECASE):
-                # Assign a friction value of 1.0 for ROUGH
-                friction_dict[friction_name] = 1.0
+                # Do not pretend ROUGH is mu=1.0.  Mark it so the interface
+                # writer can emit a loud warning and an explicit approximation.
+                friction_dict[friction_name] = ROUGH_FRICTION_MARKER
                 friction_line = False
                 continue
 
@@ -3971,11 +4096,28 @@ def convert_contacts(input_lines, property_names, surf_id, friction_dict, surf_n
 
     def friction_lines(interaction, ppm=False):
         """Write the trailing Fric/IBC card lines for the last TYPE24 block."""
-        try:
-            friction_value = float(friction_dict.get(interaction, 0) or 0)
-        except (TypeError, ValueError):
-            friction_value = 0.0
-            print(f"### WARNING ###: non-numeric friction '{interaction}'; using 0.0")
+        raw_friction = friction_dict.get(interaction, 0)
+        if raw_friction == ROUGH_FRICTION_MARKER:
+            # Radioss has no no-slip flag: Ifric 0..4 are Coulomb / viscous /
+            # Darmstad / Renard / exponential-decay laws, and /FRICTION has
+            # the same set.  A high static-Coulomb coefficient is the closest
+            # penalty-contact approximation; make it explicit and loud.
+            friction_value = ROUGH_FRICTION_COEFF
+            print("### WARNING ###: '*FRICTION, ROUGH' interaction "
+                  f"'{interaction}' has no true no-slip representation in "
+                  "/INTER/TYPE24 (Ifric=0..4 are Coulomb/viscous/Darmstad/"
+                  "Renard/exponential, none is 'rough').  Writing "
+                  f"mu={ROUGH_FRICTION_COEFF:g} with Ifric=0 (static Coulomb) "
+                  "as an APPROXIMATION; use a tied interface for true no-slip.")
+            contacts.append("# NOTE: ROUGH contact approximated by high "
+                            "Coulomb mu; TYPE24 has no no-slip flag")
+        else:
+            try:
+                friction_value = float(raw_friction or 0)
+            except (TypeError, ValueError):
+                friction_value = 0.0
+                print(f"### WARNING ###: non-numeric friction "
+                      f"'{interaction}'; using 0.0")
         contacts.append(f"{controls['stfac']:>20.8g}{'':>10}{friction_value:>10}"
                         "                                       0                   0")
         contacts.append("#      IBC                        Inacti               ViscS                             ")
@@ -4188,20 +4330,33 @@ def convert_contacts(input_lines, property_names, surf_id, friction_dict, surf_n
         print(f"### WARNING ###: {exclusions_seen} *CONTACT EXCLUSIONS block(s) "
               "were dropped; review contact definitions manually.")
 
-    # P1: warn about friction/cohesive data that Radioss Type24 cannot express.
+    # P1/P2: warn explicitly about friction/cohesive data that Radioss
+    # Type24 cannot express.  The constant coefficient is still written (the
+    # only part that maps to /INTER/TYPE24 Fric), everything else is dropped.
     for line in input_lines:
         stripped = line.strip()
         if re.search(r'^\*FRICTION\b', stripped, re.IGNORECASE) and ',' in stripped:
             options = stripped.split(',')[1:]
-            if any('DEPEND' in opt.upper() or 'RATE' in opt.upper()
-                   or 'TEMPER' in opt.upper() for opt in options):
-                print("### WARNING ###: friction with rate/temperature "
-                      "dependencies is not translated; only the constant "
-                      "coefficient is used.")
+            dependency = next(
+                (opt.strip() for opt in options
+                 if any(key in opt.upper() for key in
+                        ('DEPEND', 'RATE', 'TEMPER'))),
+                None)
+            if dependency:
+                print("### WARNING ###: *FRICTION option "
+                      f"'{dependency}' (rate/temperature-dependent friction) "
+                      "cannot be mapped to /INTER/TYPE24: Ifric only offers "
+                      "Coulomb/viscous/Darmstad/Renard/exponential laws and "
+                      "no temperature dependence.  Only the constant mu is "
+                      "written; the dependency table is DROPPED.  Review the "
+                      "contact card manually or use a user friction law.")
         if (stripped.lower().startswith('*cohesive behavior')
                 or stripped.lower().startswith('*cohesive section')):
-            print("### WARNING ###: cohesive traction-separation behaviour is "
-                  "not translated; cohesive contact is dropped.")
+            print("### WARNING ###: cohesive traction-separation behaviour "
+                  "cannot be mapped to /INTER/TYPE24 (it has no cohesive "
+                  "traction/separation fields); cohesive contact is DROPPED.  "
+                  "Model the adhesive layer with cohesive elements/laws "
+                  "instead if it is required.")
 
     return contacts, surf_id, inter_id
 

@@ -23,6 +23,19 @@ list see [`input_converters/inp2rad/README.md`](../input_converters/inp2rad/READ
   faces use the same **corner** loop with opposite orientation: `spos` is the
   corner loop, `sneg` its reverse (`[2,1,0]` for S6, `[3,2,1,0]` for S8).  The
   extra S6/S8 nodes are mid-side nodes and are not the opposite face.
+* These element types are now parsed (they used to be dropped as "unknown"),
+  and S6/S8 are written structurally as **degraded** Radioss elements:
+  `/SH3N` (corner triangle) and `/SHELL` (corner quad).  The starter accepts
+  their `/SURF/SEG` contact faces (validated by the solver-gated tests).
+* **2-D/beam faces are not valid 3-D `/SURF/SEG` contact surfaces.**  Radioss
+  reads four node ids per segment; a two-node line/beam face makes it read
+  node id 0 and abort (`UNDEFINED NODE NUMBER` / null-area errors).  Such
+  segments are therefore omitted, warned about, and a surface made only of
+  them is withheld from contact/tie lookups (its `*CONTACT PAIR` is skipped).
+  Line/beam elements are not emitted as Radioss structural elements because
+  inp2rad cannot derive a `/PROP/TYPE3` beam property from the `.inp` deck.
+  Use a shell/brick surface, or model beam contact with a Type11 edge
+  interface and `/LINE/SURF` manually.
 * A surface with a blank side creates exactly one `/SURF/PART/EXT` card using
   the id registered in the surface lookup table.  The part list is rebuilt
   for each surface, so parts from one surface never leak into another.
@@ -58,13 +71,52 @@ for contacts and pressure loads.
 * `*CONTACT CONTROLS` options `STIFFNESS=` / `GAP=` (`STFAC`, `GAP_MAX` are
   also accepted) set the Type24 `Stfac` and `Gap_max_s`/`Gap_max_m` values.
 
+### Rough / no-slip contact (`*FRICTION, ROUGH`)
+
+Abaqus `ROUGH` contact means *no sliding* once contact is established
+(infinite friction).  Radioss **has no equivalent flag**: `/INTER/TYPE24`
+(and `/FRICTION`) only offers `Ifric = 0` (static Coulomb), `1` (generalized
+viscous), `2` (modified Darmstad), `3` (Renard) and `4` (exponential decay),
+and none of these is a no-slip/rough law.  This was checked against the
+Radioss 2026 Reference Guide and the starter source
+(`starter/source/interfaces/int24/hm_read_inter_type24.F`).
+
+inp2rad therefore:
+
+1. keeps ROUGH interactions distinct from numeric coefficients
+   (`ROUGH_FRICTION_MARKER`) instead of silently writing `mu = 1.0`;
+2. writes a **large static-Coulomb coefficient** (`ROUGH_FRICTION_COEFF`,
+   `1e6`) with `Ifric = 0` as an explicitly documented approximation;
+3. adds a `# NOTE: ROUGH contact approximated ...` comment to the deck and
+   prints a warning naming the missing no-slip flag and suggesting a tied
+   interface for true no-slip contact.
+
+The high coefficient can make a penalty contact stiff; review the interface
+(and consider `/INTER/TYPE2` ties for genuine sticking) before production
+use.  A solver-gated test confirms the resulting deck is accepted by the
+starter.
+
+### Rate/temperature-dependent friction and cohesive contact
+
+* `*FRICTION` / `*SURFACE INTERACTION` with `DEPENDENCIES`, rate or
+  temperature options: only the constant coefficient is written to Type24
+  `Fric`.  `Ifric` can express a few *velocity*-dependent laws (Darmstad,
+  Renard, exponential decay) via `C1..C6`, but there is no way to map an
+  arbitrary Abaqus friction table, and **no temperature dependence** exists
+  in Type24.  The dependency table is dropped with an explicit warning.
+* `*COHESIVE BEHAVIOR` / cohesive contact: Type24 has no traction-separation
+  fields, so cohesive contact is dropped with a warning.  Model the adhesive
+  layer with cohesive elements/laws instead.
+
 ### Known limitations / warnings
 
 | Keyword / setting | Behaviour |
 | --- | --- |
 | `*CONTACT EXCLUSIONS` | Block is skipped with a warning; excluded pairs are **not** translated.  The converter never prompts for input. |
-| Rate/temperature-dependent `*FRICTION` (or `DEPENDENCIES=`) | Only the constant coefficient is used; a warning is emitted. |
-| `*COHESIVE BEHAVIOR` / cohesive contact | Traction-separation is dropped with a warning. |
+| `*FRICTION, ROUGH` | No true no-slip flag exists in `/INTER/TYPE24`; a high Coulomb coefficient (`1e6`, `Ifric=0`) is written with a warning and a deck comment instead of the old silent `mu=1.0`. |
+| Rate/temperature-dependent `*FRICTION` (or `DEPENDENCIES=`) | Only the constant coefficient is used; the dependency table is dropped with an explicit warning (no temperature dependence in Type24). |
+| `*COHESIVE BEHAVIOR` / cohesive contact | Traction-separation is dropped with a warning; use cohesive elements/laws. |
+| 2-D/beam element surfaces (`S2`, `S2R`, `B31`, `B32`, `B33`) | Two-node faces are omitted from 3-D `/SURF/SEG` with a warning; the surface is withheld from contact/tie lookups. Line/beam structural elements are not emitted (no beam property mapping). |
 | Non-numeric friction coefficient | Falls back to `0.0` with a warning. |
 | Unsupported `*CONTACT CONTROLS` options | Warned and dropped. |
 
@@ -121,13 +173,28 @@ warned and skipped.
 
 The `unittest` suite under `input_converters/inp2rad/tests/` covers the
 contact/tie/constraint conversion paths (including a fast end-to-end
-`start()` / `write_output()` conversion that mocks interactive prompts).
+`start()` / `write_output()` conversion that mocks interactive prompts), plus:
+
+* `test_contacts.py`: fast unit tests for rough-contact detection/warnings,
+  rate/temperature and cohesive warnings, degraded-shell/line/beam segments,
+  and withholding of invalid two-node surfaces.
+* `test_solver_surfaces.py`: end-to-end conversion followed by a real
+  **OpenCourant starter** run for degraded S6/S8 shell contact faces, two-D/
+  beam faces (verifying they are withheld with a warning) and a rough-contact
+  deck.  These tests are skipped automatically when the solver is absent.
 
 Run it with:
 
 ```
 python3 -m unittest discover -s input_converters/inp2rad/tests
 ```
+
+The solver-gated tests use the starter at
+`/home/fernando/Build/OpenCourant/OpenCourant/exec/starter_linux64_gf` with
+`RAD_CFG_PATH`/`LD_LIBRARY_PATH` derived from `OPENCOURANT_PATH` (both
+overridable via `INP2RAD_STARTER` / `OPENCOURANT_PATH`).  They skip when the
+binary or config tree is missing, so the suite stays fast on machines without
+a solver build.
 
 The tests are **not yet wired into CI** (no workflow changes are part of this
 topic), so they must be run manually until a cross-branch CI update lands.

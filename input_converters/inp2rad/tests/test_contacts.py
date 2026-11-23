@@ -145,7 +145,91 @@ class SurfaceSegmentTests(ConverterTestCase):
 *FRICTION, ROUGH
 """))
         self.assertEqual(out["FricA"], "0.25")
-        self.assertEqual(out["FricRough"], 1.0)
+        # ROUGH is kept distinct from a numeric coefficient: Radioss has no
+        # no-slip flag, so the interface writer must warn and approximate.
+        self.assertEqual(out["FricRough"], inp2rad.ROUGH_FRICTION_MARKER)
+
+    def test_degraded_shell_and_line_elements_are_parsed(self):
+        # process_element_block is the unit that used to drop these types with
+        # "Unknown element type" and leave surfaces empty.
+        parsed = inp2rad.process_element_block(
+            lines("1, 1, 2, 3, 4, 5, 6\n"), "S6", 0)
+        self.assertEqual(parsed[0][0]["nodes"], ["1", "2", "3", "4", "5", "6"])
+        parsed = inp2rad.process_element_block(
+            lines("2, 11, 12, 13, 14, 15, 16, 17, 18\n"), "S8", 0)
+        self.assertEqual(parsed[0][0]["nodes"],
+                         ["11", "12", "13", "14", "15", "16", "17", "18"])
+        parsed = inp2rad.process_element_block(
+            lines("4, 23, 24, 25\n"), "B32", 0)
+        self.assertEqual(parsed[0][0]["nodes"], ["23", "24", "25"])
+
+    def test_line_beam_surface_is_withheld_from_contact_lookups(self):
+        seg = inp2rad.convert_segments(element_block(
+            "B31", [(1, [1, 2])]))
+        out = inp2rad.parse_surface_data(
+            lines("*SURFACE, NAME=BeamSurf, TYPE=ELEMENT\n1, SPOS\n"),
+            {"Beams": [1]}, 0, {}, seg, {})
+        self.assertNotIn("BeamSurf", out[2])
+        self.assertFalse(any("/SURF/SEG/" in ln for ln in out[0]))
+        self.assertIn("two-node", self.printed)
+        self.assertIn("no valid 3-D segments", self.printed)
+
+    def test_mixed_shell_and_beam_surface_keeps_valid_segments(self):
+        seg = inp2rad.convert_segments(element_block(
+            "S8", [(1, [11, 12, 13, 14, 15, 16, 17, 18])]))
+        seg.update(inp2rad.convert_segments(element_block(
+            "B31", [(2, [21, 22])])))
+        out = inp2rad.parse_surface_data(
+            lines("*SURFACE, NAME=Mixed, TYPE=ELEMENT\n1, SPOS\n2, SPOS\n"),
+            {}, 0, {}, seg, {})
+        self.assertEqual(out[2]["Mixed"], 1)
+        surf = joined([ln for ln in out[0] if "/SURF/SEG/" in ln or ln.strip().startswith("11")]).strip()
+        self.assertIn("11        12        13        14", surf)
+        self.assertNotIn("21        22", surf)
+        self.assertIn("two-node", self.printed)
+
+    def test_short_face_before_valid_shell_keeps_surface_without_orphans(self):
+        # Regression for silent loss: the old per-line withholding dropped the
+        # /SURF/SEG header after the first (2-node) line, then appended the
+        # valid shell face from a later line as an orphan and hid the surface
+        # from contact lookups.  The decision must wait for the block end.
+        seg = inp2rad.convert_segments(element_block("B31", [(1, [1, 2])]))
+        seg.update(inp2rad.convert_segments(element_block(
+            "S4", [(2, [11, 12, 13, 14])])))
+        out = inp2rad.parse_surface_data(
+            lines("*SURFACE, NAME=Ordered, TYPE=ELEMENT\n"
+                  "1, SPOS\n"     # two-node beam face first
+                  "2, SPOS\n"),   # valid 4-node shell face second
+            {}, 0, {}, seg, {})
+        surface_lines, surf_map = out[0], out[2]
+        self.assertEqual(surf_map["Ordered"], 1)
+        self.assertEqual([ln for ln in surface_lines if "/SURF/SEG/" in ln],
+                         ["/SURF/SEG/1\nOrdered"])
+        seg_idx = surface_lines.index("/SURF/SEG/1\nOrdered")
+        self.assertEqual(surface_lines[seg_idx + 1].split(),
+                         ["11", "12", "13", "14"])
+        # Exactly one segment line: the 2-node face is omitted, no orphan.
+        self.assertEqual(
+            len([ln for ln in surface_lines if ln.startswith("          ")]), 1)
+        self.assertIn("two-node", self.printed)
+        self.assertNotIn("no valid 3-D segments", self.printed)
+
+        # The surface is still usable by a contact pair.
+        contacts, _, inter_id = inp2rad.convert_contacts(
+            lines("*CONTACT PAIR, INTERACTION=FricA\nOrdered, Other\n"),
+            {}, 0, {"FricA": "0.1"}, dict(surf_map, Other=2))
+        self.assertEqual(inter_id, 1)
+        self.assertIn("/INTER/TYPE24/1", joined(contacts))
+
+    def test_short_segment_warning_is_deduplicated_per_surface(self):
+        seg = inp2rad.convert_segments(element_block(
+            "B31", [(1, [1, 2]), (2, [3, 4])]))
+        out = inp2rad.parse_surface_data(
+            lines("*SURFACE, NAME=Beams, TYPE=ELEMENT\n"
+                  "1, SPOS\n2, SPOS\n"), {}, 0, {}, seg, {})
+        self.assertNotIn("Beams", out[2])
+        self.assertEqual(self.printed.count("two-node"), 1)
+        self.assertEqual(self.printed.count("no valid 3-D segments"), 1)
 
 
 class ContactPairTests(ConverterTestCase):
@@ -268,6 +352,60 @@ SurfA, SurfB
             {}, 0, {"FricA": "banana"}, self.SURFS)
         self.assertIn("non-numeric friction", self.printed)
         self.assertIn("0", joined(out))
+
+    @staticmethod
+    def _fric_line(text):
+        """Return the numeric fields of the Stfac/Fric TYPE24 card."""
+        rows = text.splitlines()
+        idx = next(i for i, row in enumerate(rows)
+                   if row.startswith("#              Stfac                Fric"))
+        card = next(row for row in rows[idx + 1:] if not row.startswith('#'))
+        return card.split()
+
+    def test_rough_contact_warns_and_uses_high_coulomb_not_mu_one(self):
+        out, _, _ = inp2rad.convert_contacts(
+            lines("*CONTACT PAIR, INTERACTION=FricRough\nSurfA, SurfB\n"),
+            {}, 0, {"FricRough": inp2rad.ROUGH_FRICTION_MARKER}, self.SURFS)
+        text = joined(out)
+        fields = self._fric_line(text)
+        self.assertEqual(float(fields[1]), inp2rad.ROUGH_FRICTION_COEFF)
+        self.assertNotEqual(float(fields[1]), 1.0)
+        ifric_line = text.splitlines()[
+            text.splitlines().index(
+                "#    Ifric    Ifiltr               Xfreq             sens_ID                                 fric_ID") + 1]
+        self.assertEqual(ifric_line.split()[0], "0")  # static Coulomb
+        self.assertIn("ROUGH contact approximated", text)
+        self.assertIn("no true no-slip representation", self.printed)
+        self.assertIn("Ifric=0..4", self.printed)
+        self.assertIn("tied interface", self.printed)
+
+    def test_rough_parsing_and_conversion_end_to_end(self):
+        friction = inp2rad.parse_surface_interaction_data(lines("""
+*SURFACE INTERACTION, NAME=RoughA
+*FRICTION, ROUGH
+"""))
+        self.assertEqual(friction["RoughA"], inp2rad.ROUGH_FRICTION_MARKER)
+        out, _, _ = inp2rad.convert_contacts(
+            lines("*CONTACT PAIR, INTERACTION=RoughA\nSurfA, SurfB\n"),
+            {}, 0, friction, self.SURFS)
+        self.assertEqual(float(self._fric_line(joined(out))[1]),
+                         inp2rad.ROUGH_FRICTION_COEFF)
+
+    def test_dependency_warning_names_dropped_table(self):
+        inp2rad.convert_contacts(lines("""
+*SURFACE INTERACTION, NAME=FricA
+*FRICTION, DEPENDENCIES=2
+0.1, 0.2
+"""), {}, 0, {"FricA": "0.1"}, self.SURFS)
+        self.assertIn("DEPENDENCIES=2", self.printed)
+        self.assertIn("dependency table is DROPPED", self.printed)
+        self.assertIn("no temperature dependence", self.printed)
+
+    def test_cohesive_warning_suggests_cohesive_elements(self):
+        inp2rad.convert_contacts(
+            lines("*COHESIVE BEHAVIOR, NAME=Coh\n"), {}, 0, {}, self.SURFS)
+        self.assertIn("cohesive traction/separation", self.printed)
+        self.assertIn("cohesive elements/laws", self.printed)
 
 
 if __name__ == "__main__":
